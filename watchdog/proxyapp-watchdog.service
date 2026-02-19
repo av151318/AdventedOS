@@ -1,0 +1,33 @@
+[Unit]
+Description=ProxyApp AI Platform Watchdog - 24/7 Uptime Monitor
+After=network.target docker.service
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=advented-gx1
+WorkingDirectory=/home/advented-gx1/Desktop/projects/AdventedOS
+ExecStart=/home/advented-gx1/Desktop/projects/AdventedOS/watchdog/watchdog.sh start
+ExecStop=/home/advented-gx1/Desktop/projects/AdventedOS/watchdog/watchdog.sh stop
+Restart=always
+RestartSec=10
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=/home/advented-gx1
+
+# Watchdog settings
+WatchdogSec=300
+WatchdogSignal=SIGTERM
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=proxyapp-watchdog
+
+[Install]
+WantedBy=multi-user.target
+

@@ -1,0 +1,74 @@
+# Model Configuration - Updated 2026-02-02
+# Preloading: Nemotron-3-Nano-NVFP4 + Hermes-4-14B-AWQ
+
+models:
+  # === PRELOADED MODELS ===
+  
+  - model_id: "nemotron-3-nano-30b-nvfp4"
+    backend: "vllm"
+    config_path: "configs/vllm_configs/nemotron-3-nano-30b-nvfp4.yaml"
+    model_path: "vllm_models/nemotron-3-nano-30b-nvfp4"
+    port: 8002
+    context_size: 32768
+    gpu_memory_utilization: 0.45
+    quantization: nvfp4
+    preload: true                            # PRELOADED
+
+  - model_id: "hermes-4-14b-awq"
+    backend: "vllm"
+    config_path: "configs/vllm_configs/hermes-4-14b-awq.yaml"
+    model_path: "vllm_models/hermes-4-14b-awq"
+    port: 8004
+    context_size: 16384
+    gpu_memory_utilization: 0.35
+    quantization: awq
+    tool_call_parser: hermes
+    preload: true                            # PRELOADED
+
+  # === ON-DEMAND MODELS ===
+
+  - model_id: "qwen2.5-coder-14b-awq"
+    backend: "vllm"
+    config_path: "configs/vllm_configs/qwen2.5-coder-14b-awq.yaml"
+    model_path: "vllm_models/qwen2.5-coder-14b-awq"
+    port: 8001
+    context_size: 20480
+    gpu_memory_utilization: 0.60
+    quantization: awq
+    preload: false
+
+  - model_id: "nouscoder-14b-awq"
+    backend: "vllm"
+    config_path: "configs/vllm_configs/nouscoder-14b-awq.yaml"
+    model_path: "vllm_models/nouscoder-14b-awq"
+    port: 8003
+    context_size: 16384
+    gpu_memory_utilization: 0.70
+    quantization: awq
+    preload: false
+
+  # llama.cpp Backend - Secondary
+  - model_id: "deepseek-coder-v2-16b-q5"
+    backend: "llamacpp"
+    model_path: "vllm_models/deepseek-coder-v2-16b-gguf/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf"
+    port: 8081
+    context_size: 10240
+    gpu_layers: -1
+    threads: 8
+    preload: false
+
+  - model_id: "llama-3.1-8b-q4"
+    backend: "llamacpp"
+    model_path: "vllm_models/Llama-3.1-8B-Q4K/Llama-3.1-8B-Instruct-UD-Q4_K_XL.gguf"
+    port: 8082
+    context_length: 8192
+    gpu_layers: 35
+    threads: 8
+    preload: false
+
+proxy_config:
+  port: 52415
+  memory_threshold: 0.90
+  enable_prompt_readiness: true
+  log_file: "logs/proxy.log"
+  health_check_interval: 60

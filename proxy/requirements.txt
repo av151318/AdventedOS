@@ -1,0 +1,6 @@
+# Proxy Platform (proxyapp) dependencies
+# Trimmed to proxy-only — no agent_service deps
+aiohttp
+pyyaml
+requests
+psutil

@@ -1,0 +1,23 @@
+# vLLM Configuration for Hermes-4-14B-AWQ
+model: "/app/model"
+tokenizer: "/app/model"
+
+# GPU and memory configuration
+tensor_parallel_size: 1
+gpu_memory_utilization: 0.25
+max_model_len: 8192
+
+# Quantization auto-detected from model config
+
+# Performance optimizations
+enable_prefix_caching: true
+enable_chunked_prefill: true
+
+# Tool calling configuration (Hermes format)
+enable_auto_tool_choice: true
+tool_call_parser: "hermes"
+
+# Serving configuration
+host: "0.0.0.0"
+port: 8004
+max_concurrent_requests: 32

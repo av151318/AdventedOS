@@ -1,0 +1,65 @@
+# Environment & secrets
+.env
+.env.*
+*.env.local
+data/
+*.key
+*.pem
+*.crt
+credentials.json
+
+# Out-of-scope services & projects
+agent/
+delegation-service/
+delegation-data/
+open-orchestra-source/
+buildflow/
+AdventedResearch/
+benchmarks/
+.opencode/
+.sisyphus/
+.cursor/
+.vscode/
+n8n-workflows/
+proxy/src/agent_service/
+orchestrator-bridge-server.js
+orchestrator-server.js
+
+# Dockerfiles for out-of-scope services
+Dockerfile.agent
+Dockerfile.opencode
+
+# Config with hardcoded secrets
+configs/opencode.json
+
+# Launcher scripts for full stack (not proxy-only)
+start-full-stack.sh
+demo_n8n_cli
+demo_n8n_beta
+
+# Runtime artifacts
+logs/
+pids/
+*.log
+*.pid
+__pycache__/
+*.pyc
+*.backup
+*.bak
+
+# Model files & environments
+vllm_models/
+vllm_env/
+vllm_build_env/
+download_venv/
+llama.cpp/
+vllm/
+
+# Dependencies
+node_modules/
+
+# Docker override (local prod extras)
+docker-compose.override.yml
+
+# IDE
+.DS_Store

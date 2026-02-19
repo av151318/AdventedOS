@@ -1,0 +1,22 @@
+# vLLM Configuration for NousCoder-14B-AWQ
+model: "/app/model"
+tokenizer: "/app/model"
+
+# GPU and memory configuration
+tensor_parallel_size: 1  # Use single GPU for faster startup
+gpu_memory_utilization: 0.70  # Reduced for headroom (from 0.75)
+max_model_len: 16384  # 16K context window
+
+# Performance optimizations
+enable_prefix_caching: true
+enable_chunked_prefill: true
+
+# Serving configuration
+host: "0.0.0.0"
+port: 8002
+max_concurrent_requests: 32
+
+# Sampling parameters
+temperature: 0.7
+top_p: 0.9
+max_tokens: 4096

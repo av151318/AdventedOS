@@ -1,0 +1,26 @@
+# vLLM Configuration for Qwen2.5-Coder-14B-AWQ
+model: "/app/model"
+tokenizer: "/app/model"
+
+# GPU and memory configuration
+tensor_parallel_size: 1  # Use single GPU for faster startup
+gpu_memory_utilization: 0.60  # Further reduced for stability (from 0.75)
+max_model_len: 20480  # Increased to 20K context window for OMO system prompts
+
+# Performance optimizations
+enable_prefix_caching: true  # Speed up repeated prompts
+enable_chunked_prefill: true
+
+# Tool calling configuration (Hermes format for Qwen)
+enable_auto_tool_choice: true
+tool_call_parser: "hermes"
+
+# Serving configuration
+host: "0.0.0.0"
+port: 8001
+max_concurrent_requests: 32
+
+# Sampling parameters
+temperature: 0.7
+top_p: 0.9
+max_tokens: 4096

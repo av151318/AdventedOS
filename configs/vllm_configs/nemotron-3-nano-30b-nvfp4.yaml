@@ -1,0 +1,36 @@
+# vLLM Configuration for Nemotron-3-Nano-30B-A3B-NVFP4
+# OFFICIAL CONFIG from NVIDIA cookbook
+
+# Per-model container image override (uses 26.01-py3 for NVFP4 support)
+container_image: "nvcr.io/nvidia/vllm:26.01-py3"
+
+model: "nemotron-3-nano-30b-nvfp4"
+tokenizer: "/model"
+
+# CRITICAL: Nemotron has custom code
+trust_remote_code: true
+
+# GPU and memory configuration  
+tensor_parallel_size: 1
+gpu_memory_utilization: 0.35
+max_model_len: 8192
+max_num_seqs: 8
+
+# NVFP4 requires FP8 KV cache
+kv_cache_dtype: fp8
+
+# Tool calling configuration
+enable_auto_tool_choice: true
+tool_call_parser: "qwen3_coder"
+
+# Reasoning parser
+reasoning_parser_plugin: "nano_v3_reasoning_parser.py"
+reasoning_parser: "nano_v3"
+
+# Serving configuration
+host: "0.0.0.0"
+port: 8002
+
+# ENV VARS REQUIRED (set in docker run):
+# VLLM_USE_FLASHINFER_MOE_FP4=1
+# VLLM_FLASHINFER_MOE_BACKEND=throughput

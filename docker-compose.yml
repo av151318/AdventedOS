@@ -1,0 +1,39 @@
+# AdventedOS — Proxy Platform Docker Services
+# This compose file manages services that complement the proxy platform.
+# The proxy platform itself runs natively (see proxy/start_proxy.sh).
+# 
+# Usage:
+#   docker compose -f docker-compose.clean.yml up -d          # Start services
+#   docker compose -f docker-compose.clean.yml down           # Stop services
+#
+# For local-only additions (n8n, agent-service, etc.), see docker-compose.override.yml.example
+
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:latest
+    container_name: open-webui
+    ports:
+      - "${WEBUI_PORT:-3000}:8080"
+    environment:
+      - ENABLE_OPENAI_API=true
+      - WEBUI_AUTH=true
+      - ENABLE_SIGNUP=true
+      - ENABLE_LOGIN_FORM=true
+      - OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL:-http://host.docker.internal:52415/v1}
+      - OPENAI_API_KEY=${PROXYAPP_API_KEY}
+      - WEBUI_SECRET_KEY=${PROXYAPP_API_KEY}
+    volumes:
+      - open-webui:/app/backend/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - adventedos-net
+    restart: unless-stopped
+
+networks:
+  adventedos-net:
+    driver: bridge
+
+volumes:
+  open-webui:
+    driver: local

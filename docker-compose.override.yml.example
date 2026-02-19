@@ -1,0 +1,179 @@
+# docker-compose.override.yml.example
+#
+# PURPOSE: Add local-only services that extend the base docker-compose.clean.yml.
+# Docker Compose automatically merges this file with docker-compose.yml when
+# you run `docker compose up` — no extra flags needed.
+#
+# SETUP: Copy this file to docker-compose.override.yml (gitignored):
+#   cp docker-compose.override.yml.example docker-compose.override.yml
+#
+# Then uncomment and configure the services you need.
+# Your local additions stay local — docker-compose.override.yml is gitignored.
+#
+# See: https://docs.docker.com/compose/multiple-compose-files/merge/
+
+# services:
+#
+#   # Agent Service - OpenCode CLI integration and orchestration logic
+#   agent-service:
+#     build:
+#       context: .
+#       dockerfile: Dockerfile.agent
+#     ports:
+#       - "${AGENT_PORT:-8005}:8001"
+#     volumes:
+#       - ./data:/app/data
+#       - ./logs:/app/logs
+#       - ./proxy/src:/app/proxy_src:ro
+#       - .:/app/project:ro
+#       - /var/run/docker.sock:/var/run/docker.sock
+#     environment:
+#       - AGENT_PORT=8001
+#       - PROXYAPP_URL=${PROXYAPP_URL:-http://host.docker.internal:52415}
+#       - PROXYAPP_API_KEY=${PROXYAPP_API_KEY}
+#       - PYTHONPATH=/app
+#       - OPENCODE_USE_PROXYAPP=true
+#       - USE_OPENCODE_FOR_CODER=true
+#     extra_hosts:
+#       - "host.docker.internal:host-gateway"
+#     networks:
+#       - adventedos-net
+#     restart: unless-stopped
+#
+#   # n8n Workflow Orchestrator (Stable)
+#   n8n:
+#     image: n8nio/n8n:2.0.3
+#     ports:
+#       - "5678:5678"
+#     volumes:
+#       - n8n_data:/home/node/.n8n
+#       - ./data:/app/data:ro
+#     environment:
+#       - N8N_HOST=0.0.0.0
+#       - N8N_PORT=5678
+#       - N8N_PROTOCOL=http
+#       - N8N_LOG_LEVEL=info
+#       - N8N_USER_FOLDER=/home/node/.n8n
+#       - PROXYAPP_URL=${PROXYAPP_URL:-http://host.docker.internal:52415}
+#       - PROXYAPP_API_KEY=${PROXYAPP_API_KEY}
+#       - AGENT_SERVICE_URL=http://agent-service:8001
+#     extra_hosts:
+#       - "host.docker.internal:host-gateway"
+#     networks:
+#       - adventedos-net
+#     restart: unless-stopped
+#
+#   # Chroma Vector Database (for RAG)
+#   chroma:
+#     image: chromadb/chroma:latest
+#     ports:
+#       - "8002:8000"
+#     volumes:
+#       - chroma_data:/chroma/chroma
+#     environment:
+#       - CHROMA_SERVER_HOST=0.0.0.0
+#       - CHROMA_SERVER_HTTP_PORT=8000
+#       - IS_PERSISTENT=TRUE
+#       - PERSIST_DIRECTORY=/chroma/chroma
+#     networks:
+#       - adventedos-net
+#     restart: unless-stopped
+#
+#   # OpenCode + Open Orchestra Integration
+#   opencode:
+#     build:
+#       context: .
+#       dockerfile: Dockerfile.opencode
+#     container_name: opencode
+#     entrypoint: ["/usr/local/bin/opencode-entrypoint"]
+#     command: ["opencode", "web", "--hostname", "0.0.0.0", "--port", "3001"]
+#     env_file:
+#       - .env
+#     networks:
+#       - adventedos-net
+#     environment:
+#       - OPENAI_API_BASE=http://host.docker.internal:52415/v1
+#       - OPENAI_API_KEY=${PROXYAPP_API_KEY}
+#       - OPENCODE_ZEN_API_KEY=${OPENCODE_ZEN_API_KEY}
+#       - PORT=3001
+#     volumes:
+#       - ./:/workspace
+#       - ./configs/opencode.json:/config/opencode.json:ro
+#       - ./agent:/root/.config/opencode/agent
+#       - ../AdventedResearch:/AdventedResearch
+#       - opencode-plugins:/root/.config/opencode/plugins
+#     ports:
+#       - "3001:3001"
+#       - "8120:8120"
+#     working_dir: /workspace
+#     stdin_open: true
+#     tty: true
+#     extra_hosts:
+#       - "host.docker.internal:host-gateway"
+#     restart: unless-stopped
+#
+#   # YouTube Transcript Service
+#   yt-transcript-service:
+#     build:
+#       context: ../microservices/youtube-transcript-service
+#     container_name: yt-transcript-service
+#     restart: unless-stopped
+#     ports:
+#       - "8110:8000"
+#     networks:
+#       - adventedos-net
+#
+#   # Obsidian Writer Service
+#   obsidian-writer:
+#     build:
+#       context: ../microservices/obsidian-writer
+#     container_name: obsidian-writer
+#     restart: unless-stopped
+#     user: "0:0"
+#     ports:
+#       - "8111:8111"
+#     volumes:
+#       - ./data/obsidian:/data/obsidian
+#     environment:
+#       - OBSIDIAN_ROOT=/data/obsidian
+#       - PORT=8111
+#     extra_hosts:
+#       - "host.docker.internal:host-gateway"
+#     networks:
+#       - adventedos-net
+#
+#   # Delegation Service - FastAPI service for Chrome extension
+#   delegation-service:
+#     build: ./delegation-service
+#     container_name: delegation-service
+#     ports:
+#       - "8080:8080"
+#     environment:
+#       - HOST=0.0.0.0
+#       - PORT=8080
+#       - AGENT_SERVICE_URL=http://agent-service:8001
+#       - OPENCODE_URL=http://opencode:3001
+#       - DATABASE_PATH=/data/delegations.db
+#       - OBSIDIAN_PATH=/data/obsidian/research
+#       - MAX_CONCURRENT_AGENTS=8
+#     volumes:
+#       - ./delegation-data:/data
+#       - ./data/obsidian/research:/data/obsidian/research
+#       - ../AdventedResearch:/AdventedResearch:ro
+#       - /var/run/docker.sock:/var/run/docker.sock
+#     networks:
+#       - adventedos-net
+#     depends_on:
+#       - agent-service
+#       - opencode
+#     restart: unless-stopped
+
+# volumes:
+#   n8n_data:
+#     driver: local
+#   chroma_data:
+#     driver: local
+#   delegation_data:
+#     driver: local
+#   opencode-plugins:
+#     driver: local
