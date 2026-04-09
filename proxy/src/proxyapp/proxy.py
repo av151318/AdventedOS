@@ -85,6 +85,7 @@ from .tracing import (
     log_chat_json_payload,
     log_api_inbound_evidence,
     log_normalized_client_payload,
+    log_stream_terminal,
     canonical_backend_chat_sse,
     projection_backend_delta,
     projection_chat_outbound_event,
@@ -599,8 +600,17 @@ class UnifiedProxy:
                 and model_info.consecutive_readiness_failures
                 >= circuit_block_heavy_fail_streak_default()
             ):
+                first_readiness_trip = float(
+                    getattr(model_info, "heavy_circuit_tripped_at", 0.0) or 0.0
+                ) <= 0.0
                 model_info.heavy_circuit_tripped_at = now
                 model_info.heavy_circuit_recovery_probes = 0
+                if first_readiness_trip:
+                    logger.warning(
+                        "[ADMISSION] heavy circuit tripped model=%s (readiness streak>=%s)",
+                        model_id,
+                        circuit_block_heavy_fail_streak_default(),
+                    )
             return False
 
     def _heavy_circuit_blocks_heavy_admission(self, model_info) -> bool:
@@ -629,6 +639,19 @@ class UnifiedProxy:
             model_id,
         )
 
+    def _admission_ledger_zero_contract(
+        self, *, error: str, terminal_classifier: str = "admission_not_ready"
+    ) -> Dict[str, Any]:
+        """Stable top-level fields for admission 503/502 bodies (no stream bytes committed)."""
+        return {
+            "error": error,
+            "code": "admission_not_ready",
+            "committed_text_offset": 0,
+            "committed_reasoning_offset": 0,
+            "first_byte_sent": False,
+            "terminal_classifier": terminal_classifier,
+        }
+
     async def _emit_abnormal_stream_terminal(
         self,
         stream_response: web.StreamResponse,
@@ -636,8 +659,22 @@ class UnifiedProxy:
         term: str,
         *,
         request_json: Optional[Dict[str, Any]] = None,
+        route: str = "POST /v1/chat/completions",
+        log_api: str = "v1/chat_completions",
     ) -> None:
         if term == "client_disconnect":
+            elig = (
+                is_retry_eligible(ledger, request_json)
+                if request_json is not None
+                else False
+            )
+            logger.info(
+                "[stream_terminal] request_id=%s term=client_disconnect ledger=%s "
+                "retry_eligible_read_only=%s no_terminal_sse=True",
+                ledger.request_id,
+                ledger.to_audit_dict(),
+                elig,
+            )
             return
         ledger.terminal_classifier = term
         if request_json is not None:
@@ -671,6 +708,23 @@ class UnifiedProxy:
                 + "\n\n"
             )
             await sse_write(stream_response, line.encode("utf-8"))
+            log_stream_terminal(
+                ledger.request_id,
+                api=log_api,
+                route=route,
+                backend_delta_rows=0,
+                outbound_delta_rows=0,
+                finish_reason="tool_boundary_crossed",
+                content_chars=ledger.committed_text_offset,
+                reasoning_chars=ledger.committed_reasoning_offset,
+                n_tool_calls=1 if ledger.last_tool_event else 0,
+                promoted_xml_tools=False,
+                proxy_aggregated_outcome={
+                    **ledger.to_audit_dict(),
+                    "terminal": term,
+                    "sse": "response.failed",
+                },
+            )
             return
         code = (
             term
@@ -689,6 +743,19 @@ class UnifiedProxy:
             + "\n\n"
         )
         await sse_write(stream_response, line.encode("utf-8"))
+        log_stream_terminal(
+            ledger.request_id,
+            api=log_api,
+            route=route,
+            backend_delta_rows=0,
+            outbound_delta_rows=0,
+            finish_reason=term,
+            content_chars=ledger.committed_text_offset,
+            reasoning_chars=ledger.committed_reasoning_offset,
+            n_tool_calls=1 if ledger.last_tool_event else 0,
+            promoted_xml_tools=False,
+            proxy_aggregated_outcome={**ledger.to_audit_dict(), "terminal": term},
+        )
 
     def _readiness_log_failure(self, model_id: str, model_info, result: _ReadinessProbeResult) -> None:
         logger.warning(
@@ -798,12 +865,17 @@ class UnifiedProxy:
         degraded: bool,
     ) -> Dict[str, Any]:
         if degraded:
+            detail = {
+                "message": f"Model {model_id} engine is unhealthy (lost readiness after it was serving).",
+                "type": "engine_unhealthy",
+                "code": "engine_unhealthy",
+            }
             return {
-                "error": {
-                    "message": f"Model {model_id} engine is unhealthy (lost readiness after it was serving).",
-                    "type": "engine_unhealthy",
-                    "code": "engine_unhealthy",
-                },
+                **self._admission_ledger_zero_contract(
+                    error="engine_degraded",
+                    terminal_classifier="admission_not_ready",
+                ),
+                "error_detail": detail,
                 "status": "degraded",
                 "model_id": model_id,
                 "message": "Backend container is running but readiness checks fail. See proxy logs for /health and /v1/models details.",
@@ -816,12 +888,17 @@ class UnifiedProxy:
                 "output": [],
                 "choices": [],
             }
+        detail_loading = {
+            "message": f"Model {model_id} is still initializing. This typically takes 1-2 minutes for first load.",
+            "type": "model_loading",
+            "code": "model_not_ready",
+        }
         return {
-            "error": {
-                "message": f"Model {model_id} is still initializing. This typically takes 1-2 minutes for first load.",
-                "type": "model_loading",
-                "code": "model_not_ready",
-            },
+            **self._admission_ledger_zero_contract(
+                error="model_loading",
+                terminal_classifier="admission_not_ready",
+            ),
+            "error_detail": detail_loading,
             "status": "loading",
             "model_id": model_id,
             "message": "Model container is running but not ready yet. Please wait and retry in 30 seconds.",
@@ -1299,22 +1376,31 @@ class UnifiedProxy:
                         model_info=model_info,
                         container_running=container_running,
                     )
-                    return web.json_response({
-                        "error": {
-                            "message": message,
-                            "type": "model_loading",
-                            "code": "model_not_ready"
+                    return web.json_response(
+                        {
+                            **self._admission_ledger_zero_contract(
+                                error="model_loading",
+                                terminal_classifier="admission_not_ready",
+                            ),
+                            "error_detail": {
+                                "message": message,
+                                "type": "model_loading",
+                                "code": "model_not_ready",
+                            },
+                            "status": "loading",
+                            "model_id": model_id,
+                            "container_running": container_running,
+                            "container_ready": container_ready,
+                            "queue_size": self.request_queue.get_queue_size(model_id),
+                            "message": "Please wait and retry in 30 seconds.",
+                            "readiness": {
+                                "last_probe_class": model_info.last_readiness_probe_class
+                            },
+                            "output": [],
+                            "choices": [],
                         },
-                        "status": "loading",
-                        "model_id": model_id,
-                        "container_running": container_running,
-                        "container_ready": container_ready,
-                        "queue_size": self.request_queue.get_queue_size(model_id),
-                        "message": "Please wait and retry in 30 seconds.",
-                        "readiness": {"last_probe_class": model_info.last_readiness_probe_class},
-                        "output": [],
-                        "choices": [],
-                    }, status=503)
+                        status=503,
+                    )
                 
                 # Start loading model
                 logger.info(f"Loading model {model_id} for request")
@@ -1816,6 +1902,8 @@ class UnifiedProxy:
                             ledger_r,
                             "upstream_eof",
                             request_json=original_request,
+                            route="POST /v1/responses",
+                            log_api="v1/responses",
                         )
                         rs_sanitizer.finalize()
                         tool_audit_r.sanitizer_eof = rs_sanitizer.trace_state()
@@ -2044,6 +2132,14 @@ class UnifiedProxy:
                             idle_timeout=idle_timeout_r,
                         )
                         if term_r == "client_disconnect":
+                            await self._emit_abnormal_stream_terminal(
+                                resp,
+                                ledger_r,
+                                "client_disconnect",
+                                request_json=original_request,
+                                route="POST /v1/responses",
+                                log_api="v1/responses",
+                            )
                             rs_sanitizer.finalize()
                             tool_audit_r.sanitizer_eof = rs_sanitizer.trace_state()
                             pa.finish_reason = finish_reason_r
@@ -2059,10 +2155,23 @@ class UnifiedProxy:
                                 log_api="v1/responses",
                             )
                             return resp
+                        logger.info(
+                            "[CLASSIFY] request_id=%s term=%s mid_stream=%s idle_timeout=%s ledger=%s",
+                            ledger_r.request_id,
+                            term_r,
+                            ledger_r.first_byte_sent,
+                            idle_timeout_r,
+                            ledger_r.to_audit_dict(),
+                        )
                         if should_trip_admission_on_classify(term_r):
                             self._trip_heavy_admission_circuit(model_id)
                         await self._emit_abnormal_stream_terminal(
-                            resp, ledger_r, term_r, request_json=original_request
+                            resp,
+                            ledger_r,
+                            term_r,
+                            request_json=original_request,
+                            route="POST /v1/responses",
+                            log_api="v1/responses",
                         )
                         rs_sanitizer.finalize()
                         tool_audit_r.sanitizer_eof = rs_sanitizer.trace_state()
@@ -2190,18 +2299,36 @@ class UnifiedProxy:
             term_x = classify_stream_termination(
                 exc=e, saw_done=False, mid_stream=mid, idle_timeout=False
             )
-            if lr is not None and term_x != "client_disconnect":
-                if should_trip_admission_on_classify(term_x):
+            if lr is not None:
+                if term_x == "client_disconnect":
                     try:
-                        self._trip_heavy_admission_circuit(model_id)
+                        await self._emit_abnormal_stream_terminal(
+                            resp,
+                            lr,
+                            "client_disconnect",
+                            request_json=original_request,
+                            route="POST /v1/responses",
+                            log_api="v1/responses",
+                        )
                     except Exception:
                         pass
-                try:
-                    await self._emit_abnormal_stream_terminal(
-                        resp, lr, term_x, request_json=original_request
-                    )
-                except Exception:
-                    pass
+                else:
+                    if should_trip_admission_on_classify(term_x):
+                        try:
+                            self._trip_heavy_admission_circuit(model_id)
+                        except Exception:
+                            pass
+                    try:
+                        await self._emit_abnormal_stream_terminal(
+                            resp,
+                            lr,
+                            term_x,
+                            request_json=original_request,
+                            route="POST /v1/responses",
+                            log_api="v1/responses",
+                        )
+                    except Exception:
+                        pass
             try:
                 if locals().get("pa") and locals().get("tool_audit_r") and locals().get("rs_sanitizer"):
                     await self._finalize_chat_stream_production_audit(
@@ -2651,13 +2778,19 @@ class UnifiedProxy:
             )
             return web.json_response(
                 {
-                    "error": f"Model {model_id} container is not running.",
+                    **self._admission_ledger_zero_contract(
+                        error="container_down",
+                        terminal_classifier="admission_not_ready",
+                    ),
+                    "error_detail": {
+                        "message": f"Model {model_id} container is not running.",
+                    },
                     "status": "unloaded",
                     "message": "Please wait for the model to load, then retry.",
                     "output": [],
                     "choices": [],
                 },
-                status=503
+                status=503,
             )
 
         if model_info.backend == ModelBackend.VLLM:
@@ -2697,7 +2830,11 @@ class UnifiedProxy:
                             pass
                         return web.json_response(
                             {
-                                "error": {
+                                **self._admission_ledger_zero_contract(
+                                    error="admission_circuit_open",
+                                    terminal_classifier="admission_circuit_open",
+                                ),
+                                "error_detail": {
                                     "message": (
                                         f"Model {model_id} recently failed readiness; long-context "
                                         "admissions are paused until the engine recovers."
@@ -2737,14 +2874,16 @@ class UnifiedProxy:
             body = self._json_model_not_ready(
                 model_id, model_info, container_running=True, degraded=degraded
             )
-            if deny_reason == "heavy_requires_health_200" and isinstance(body.get("error"), dict):
-                em = str(body["error"].get("message") or "")
-                body["error"]["message"] = (
+            if deny_reason == "heavy_requires_health_200" and isinstance(
+                body.get("error_detail"), dict
+            ):
+                em = str(body["error_detail"].get("message") or "")
+                body["error_detail"]["message"] = (
                     em
                     + " Estimated long prompt requires a healthy /health endpoint; "
                     "the backend is returning non-200 on /health."
                 ).strip()
-                body["error"]["code"] = "heavy_admission_blocked"
+                body["error_detail"]["code"] = "heavy_admission_blocked"
             return web.json_response(body, status=503)
 
         self._note_tool_runtime_from_messages(request, data.get("messages"), "POST /v1/chat_completions")
@@ -3256,6 +3395,14 @@ class UnifiedProxy:
                             idle_timeout=idle_timeout,
                         )
                         if term == "client_disconnect":
+                            await self._emit_abnormal_stream_terminal(
+                                response,
+                                ledger,
+                                "client_disconnect",
+                                request_json=client_normalized,
+                                route=route_label,
+                                log_api="v1/chat_completions",
+                            )
                             r_tail, v_tail = sanitizer.finalize()
                             tool_audit.sanitizer_eof = sanitizer.trace_state()
                             pa.finish_reason = finish_reason
@@ -3270,10 +3417,23 @@ class UnifiedProxy:
                                 route=route_label,
                             )
                             return response
+                        logger.info(
+                            "[CLASSIFY] request_id=%s term=%s mid_stream=%s idle_timeout=%s ledger=%s",
+                            ledger.request_id,
+                            term,
+                            ledger.first_byte_sent,
+                            idle_timeout,
+                            ledger.to_audit_dict(),
+                        )
                         if should_trip_admission_on_classify(term):
                             self._trip_heavy_admission_circuit(model_id)
                         await self._emit_abnormal_stream_terminal(
-                            response, ledger, term, request_json=client_normalized
+                            response,
+                            ledger,
+                            term,
+                            request_json=client_normalized,
+                            route=route_label,
+                            log_api="v1/chat_completions",
                         )
                         sanitizer.finalize()
                         tool_audit.sanitizer_eof = sanitizer.trace_state()
