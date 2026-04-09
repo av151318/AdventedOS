@@ -52,6 +52,18 @@ class ModelInfo:
     last_access_time: float = 0.0
     request_count: int = 0
     openapi_extra: Optional[Dict] = None  # Additional OpenAPI schema fields
+    # Proxy-managed readiness lifecycle (in-memory; not persisted across restarts)
+    last_ready_at: float = 0.0
+    first_not_ready_at: float = 0.0
+    consecutive_readiness_failures: int = 0
+    readiness_ever_served: bool = False
+    last_readiness_probe_class: str = ""
+    last_engine_recreate_at: float = 0.0
+    last_engine_recreate_reason: str = ""
+    readiness_fail_bucket_ts: float = 0.0
+    # Heavy-lane admission circuit (Docker owns restart; proxy gates long-context admission)
+    heavy_circuit_tripped_at: float = 0.0
+    heavy_circuit_recovery_probes: int = 0
 
 class ModelManager:
     """Manages model lifecycle and routing"""
@@ -464,7 +476,7 @@ class ModelManager:
         if model_dir.exists() and any(model_dir.glob("*.safetensors")):
             # Use local mounted path
             cmd_args = [
-                "python", "-m", "vllm.entrypoints.openai.api_server",
+                "python3", "-m", "vllm.entrypoints.openai.api_server",
                 "--model", "/app/model",
                 "--host", "0.0.0.0",
                 "--port", str(model.port)
@@ -472,7 +484,7 @@ class ModelManager:
         else:
             # Use HuggingFace name
             cmd_args = [
-                "python", "-m", "vllm.entrypoints.openai.api_server",
+                "python3", "-m", "vllm.entrypoints.openai.api_server",
                 "--model", config.get("model", model.model_path),
                 "--host", "0.0.0.0",
                 "--port", str(model.port)
@@ -496,12 +508,61 @@ class ModelManager:
             cmd_args.extend(["--max-num-seqs", str(config["max_num_seqs"])])
         if "kv_cache_dtype" in config:
             cmd_args.extend(["--kv-cache-dtype", str(config["kv_cache_dtype"])])
+        if "mamba_ssm_cache_dtype" in config:
+            cmd_args.extend(["--mamba_ssm_cache_dtype", str(config["mamba_ssm_cache_dtype"])])
+        if "num_gpu_blocks_override" in config:
+            cmd_args.extend(["--num-gpu-blocks-override", str(config["num_gpu_blocks_override"])])
+        if "max_num_batched_tokens" in config:
+            cmd_args.extend(["--max-num-batched-tokens", str(config["max_num_batched_tokens"])])
+        if config.get("enable_chunked_prefill"):
+            cmd_args.append("--enable-chunked-prefill")
+            logger.info(
+                "[DIAG] vLLM enable_chunked_prefill=true model=%s max_num_batched_tokens=%s",
+                model.model_id,
+                config.get("max_num_batched_tokens"),
+            )
+        if config.get("disable_async_output_proc"):
+            cmd_args.append("--disable-async-output-proc")
+            logger.warning(
+                "[DIAG] vLLM disable_async_output_proc=true model=%s (stability trade-off; may reduce perf)",
+                model.model_id,
+            )
+        # Concurrent partial prefill is not enabled on many V1 / NGC builds (NotImplementedError).
+        # Opt in explicitly with enable_concurrent_partial_prefill: true in the model yaml.
+        if config.get("enable_concurrent_partial_prefill"):
+            if "max_num_partial_prefills" in config:
+                cmd_args.extend(
+                    ["--max-num-partial-prefills", str(config["max_num_partial_prefills"])]
+                )
+            if "max_long_partial_prefills" in config:
+                cmd_args.extend(
+                    ["--max-long-partial-prefills", str(config["max_long_partial_prefills"])]
+                )
+            elif "max_long_prefills" in config:
+                cmd_args.extend(["--max-long-prefills", str(config["max_long_prefills"])])
+            if "long_prefill_token_threshold" in config:
+                cmd_args.extend(
+                    [
+                        "--long-prefill-token-threshold",
+                        str(config["long_prefill_token_threshold"]),
+                    ]
+                )
+            logger.warning(
+                "[DIAG] vLLM enable_concurrent_partial_prefill=true model=%s — verify engine supports these flags",
+                model.model_id,
+            )
+        if config.get("enable_prefix_caching"):
+            cmd_args.append("--enable-prefix-caching")
+        if config.get("enforce_eager"):
+            cmd_args.extend(["--enforce-eager"])
 
         # Tool calling configuration
         if config.get("enable_auto_tool_choice"):
             cmd_args.extend(["--enable-auto-tool-choice"])
         if "tool_call_parser" in config:
             cmd_args.extend(["--tool-call-parser", str(config["tool_call_parser"])])
+        if "tool_parser_plugin" in config:
+            cmd_args.extend(["--tool-parser-plugin", f"/app/plugins/{config['tool_parser_plugin']}"])
 
         # Reasoning parser configuration
         if "reasoning_parser" in config:
@@ -509,6 +570,12 @@ class ModelManager:
         if "reasoning_parser_plugin" in config:
             cmd_args.extend(["--reasoning-parser-plugin", f"/app/plugins/{config['reasoning_parser_plugin']}"]) 
         # Mount model directory for local loading
+
+        # Default chat template kwargs (server-level defaults for reasoning control)
+        if "default_chat_template_kwargs" in config:
+            import json
+            default_kwargs = json.dumps(config["default_chat_template_kwargs"], separators=(",", ": "))
+            cmd_args.extend(["--default-chat-template-kwargs", default_kwargs])
         model_dir_abs = model_dir.resolve()
 
         
@@ -527,8 +594,6 @@ class ModelManager:
             "-v", f"{workspace_abs}/proxy:/app/plugins:ro",
             "--env", "PYTHONPATH=/app",
             "--env", "NVIDIA_DISABLE_REQUIRE=true",
-            "--env", "VLLM_USE_FLASHINFER_MOE_FP4=1",
-            "--env", "VLLM_FLASHINFER_MOE_BACKEND=throughput",
             container_image
         ] + cmd_args
         
@@ -643,6 +708,29 @@ class ModelManager:
         logger.info(f"Container {model.container_name} exists but not ready yet - will check on first request")
         return False  # Return False so status stays "loading"
 
+    @staticmethod
+    def _readiness_message_has_output(message: dict) -> tuple:
+        """Detect any non-empty assistant signal vLLM may use besides content/reasoning_content."""
+        skip = {"role", "refusal", "audio", "function_call"}
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return True, "content"
+        if isinstance(content, list) and content:
+            return True, "content[list]"
+        for key in ("reasoning_content", "reasoning", "reasoning_text", "oai_reasoning"):
+            v = message.get(key)
+            if isinstance(v, str) and v.strip():
+                return True, key
+        tcs = message.get("tool_calls")
+        if isinstance(tcs, list) and len(tcs) > 0:
+            return True, "tool_calls"
+        for k, v in message.items():
+            if k in skip or v is None:
+                continue
+            if isinstance(v, str) and len(v.strip()) > 2:
+                return True, k
+        return False, ""
+
     def _test_model_readiness(self, model: ModelInfo) -> bool:
         """Test model readiness with a simple prompt - cluster-grade validation"""
         import requests
@@ -711,26 +799,20 @@ class ModelManager:
 
                     # Check if we got a valid response with content
                     if "choices" in result and len(result["choices"]) > 0:
-                        message = result["choices"][0].get("message", {})
-                        # Handle None values from API (vLLM may return None instead of empty string)
+                        message = result["choices"][0].get("message", {}) or {}
+                        ok, note = self._readiness_message_has_output(message)
+                        if ok:
+                            logger.info(f"[DIAG] [_TEST_READINESS] ✓ {model.model_id} ready in {elapsed:.1f}s (attempt {attempt+1}) via {note}")
+                            logger.info(f"[DIAG] [_TEST_READINESS] message keys: {list(message.keys())}")
+                            return True
                         content_raw = message.get("content")
                         reasoning_raw = message.get("reasoning_content")
-                        content = (content_raw or "").strip()
-                        reasoning = (reasoning_raw or "").strip()
-
-                        # Accept either content OR reasoning (for DeepSeek-R1/Qwen3 style models)
-                        # For reasoning models, accept partial responses during startup
-                        has_content = content and len(content) > 0
-                        has_reasoning = reasoning and len(reasoning) > 0
-                        is_reasoning_model_partial = (model.backend == ModelBackend.VLLM and
-                                                    len(content) >= 5)  # Accept "<think>" prefix
-
-                        if has_content or has_reasoning or is_reasoning_model_partial:
-                            logger.info(f"[DIAG] [_TEST_READINESS] ✓ {model.model_id} ready in {elapsed:.1f}s (attempt {attempt+1})")
-                            logger.info(f"[DIAG] [_TEST_READINESS] Response: content='{content[:50]}...', reasoning='{reasoning[:50]}...'")
-                            return True
-                        else:
-                            logger.warning(f"[DIAG] [_TEST_READINESS] Empty response on attempt {attempt+1}: content='{content}', reasoning='{reasoning}'")
+                        content = (content_raw or "").strip() if isinstance(content_raw, str) else ""
+                        reasoning = (reasoning_raw or "").strip() if isinstance(reasoning_raw, str) else ""
+                        logger.warning(
+                            f"[DIAG] [_TEST_READINESS] Empty response on attempt {attempt+1}: "
+                            f"content={content!r} reasoning={reasoning!r}"
+                        )
                     else:
                         logger.warning(f"[DIAG] [_TEST_READINESS] Invalid response format on attempt {attempt+1}: {result}")
                 else:
@@ -937,6 +1019,14 @@ class ModelManager:
                 model.container_name = None
                 model.process = None
                 model.status = "unloaded"
+                model.last_ready_at = 0.0
+                model.first_not_ready_at = 0.0
+                model.consecutive_readiness_failures = 0
+                model.readiness_ever_served = False
+                model.last_readiness_probe_class = ""
+                model.readiness_fail_bucket_ts = 0.0
+                model.heavy_circuit_tripped_at = 0.0
+                model.heavy_circuit_recovery_probes = 0
                 logger.info(f"Model {model_id} unloaded successfully")
                 return True
             else:

@@ -87,7 +87,10 @@ class RequestQueue:
     def get_queue_size(self, model_id: str) -> int:
         """Get queue size for a model"""
         return len(self.queues.get(model_id, []))
-    
+
+    def has_queued(self, model_id: str) -> bool:
+        return bool(self.queues.get(model_id, []))
+
     def clear_queue(self, model_id: str):
         """Clear queue for a model"""
         if model_id in self.queues:

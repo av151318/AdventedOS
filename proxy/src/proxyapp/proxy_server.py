@@ -19,7 +19,7 @@ if _current_file.parents[1].name == "proxyapp" and _current_file.parents[2].name
     # We're in the container structure
     REPO_ROOT = Path("/app")
 else:
-    # We're in the host structure - go up 3 levels from proxyapp/proxy_server.py
+    # We're in the host structure - go up 3 levels from "proxyapp.proxy"_server.py
     try:
         REPO_ROOT = _current_file.parents[3]
     except IndexError:
@@ -32,33 +32,70 @@ from .diagnostics import Diagnostics
 # Configure logging - setup will be completed in main() with file handler
 logger = logging.getLogger(__name__)
 
-async def warmup_llama_model(proxy):
-    """Warm up llama-3.1-8b-q4k-q4_k to ensure it's hot and fast."""
-    try:
-        logger.info("[WARMUP] Starting llama-3.1-8b-q4k-q4_k warmup...")
 
-        # Small test request to warm up the model
+class _FlushingFileHandler(logging.FileHandler):
+    """Disk-backed handler that flushes after each record (crash-safe observability)."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        super().emit(record)
+        self.flush()
+
+
+class _QuietProbeAccessFilter(logging.Filter):
+    """Drop aiohttp access lines for high-frequency probe endpoints (polluters in proxy.log)."""
+
+    _MARKERS = (
+        "GET /healthcheck ",
+        "GET /v1/models ",
+        "GET /v1/chat/completions/models ",
+        "GET /v1/responses/models ",
+        "GET /watchdog/status ",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        return not any(m in msg for m in self._MARKERS)
+
+# Canonical default: <repo>/logs/proxy.log (never cwd-relative unless user overrides).
+_DEFAULT_PROXY_LOG = (REPO_ROOT / "logs" / "proxy.log").resolve()
+
+async def warmup_llama_model(proxy):
+    """Warm up llama-3.1-8b-q4k-q4_k via HTTP (chat_completions expects aiohttp Request, not a dict)."""
+    try:
+        import aiohttp
+
+        model_id = "llama-3.1-8b-q4k-q4_k"
+        if model_id not in proxy.model_manager.models:
+            logger.warning("[WARMUP] %s not in models config; skipping warmup", model_id)
+            return True
+
+        logger.info("[WARMUP] Starting %s warmup...", model_id)
         test_request = {
-            "model": "llama-3.1-8b-q4k-q4_k",
+            "model": model_id,
             "messages": [{"role": "user", "content": "Hello"}],
             "max_tokens": 5,
-            "temperature": 0.1
+            "temperature": 0.1,
+            "stream": False,
         }
-
-        start_time = asyncio.get_event_loop().time()
-        response = await proxy.chat_completions(test_request)
-        end_time = asyncio.get_event_loop().time()
-
-        latency = (end_time - start_time) * 1000  # ms
-        logger.info(f"[WARMUP] ✓ Llama-3.1 warmup completed in {latency:.1f}ms")
-
-        if latency > 15000:  # 15 seconds
-            logger.warning(f"[WARMUP] ⚠ Warmup took {latency:.1f}ms (>15s target)")
-
+        url = f"http://127.0.0.1:{proxy.proxy_port}/v1/chat/completions"
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        timeout = aiohttp.ClientTimeout(total=120)
+        http_status = 0
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=test_request) as resp:
+                http_status = resp.status
+                await resp.text()
+        latency_ms = (loop.time() - t0) * 1000.0
+        logger.info("[WARMUP] ✓ %s warmup completed in %.1fms (http %s)", model_id, latency_ms, http_status)
+        if latency_ms > 15000:
+            logger.warning("[WARMUP] ⚠ Warmup took %.1fms (>15s target)", latency_ms)
         return True
-
     except Exception as e:
-        logger.error(f"[WARMUP] ✗ Llama-3.1 warmup failed: {e}")
+        logger.error("[WARMUP] ✗ Llama-3.1 warmup failed: %s", e)
         return False
 
 async def main():
@@ -98,26 +135,46 @@ async def main():
     parser.add_argument(
         "--log-file",
         type=str,
-        default="logs/proxy.log",
-        help="Path to log file (default: logs/proxy.log)"
+        default=os.environ.get("PROXY_LOG_FILE", str(_DEFAULT_PROXY_LOG)),
+        help=f"Path to log file (default: {_DEFAULT_PROXY_LOG} or PROXY_LOG_FILE env)",
     )
-    
+
     args = parser.parse_args()
-    
-    # Setup persistent logging to disk
-    log_file = Path(args.log_file)
+
+    # Setup persistent logging to disk (always resolve to absolute path)
+    log_file = Path(args.log_file).expanduser().resolve()
     log_file.parent.mkdir(parents=True, exist_ok=True)
     
-    # Configure root logger with both console and file handlers
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(log_file)
-        ]
-    )
-    logger.info(f"[PROXY_START] Logging to {log_file}")
+    # Configure logging - single handler; flush each line so tail -f / post-mortem sees traces
+    file_handler = _FlushingFileHandler(log_file, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    
+    # Get root logger and add handler
+    root_logger = logging.getLogger()
+    root_logger.addHandler(file_handler)
+    root_logger.setLevel(logging.INFO)
+    
+    # Configure child loggers to use root logger handlers
+    for logger_name in ["proxyapp", "proxyapp.proxy", "proxyapp.trace", "proxyapp.audit", "proxyapp.model_manager", "proxyapp.memory_manager"]:
+        child_logger = logging.getLogger(logger_name)
+        child_logger.setLevel(logging.DEBUG)
+        child_logger.propagate = True
+    
+    # Access log for real API traffic; probe paths filtered (see _QuietProbeAccessFilter).
+    _acc = logging.getLogger("aiohttp.access")
+    _acc.setLevel(logging.INFO)
+    _acc.addFilter(_QuietProbeAccessFilter())
+    
+    logger.info("[PROXY_START] Logging to %s (repo_root=%s)", log_file, REPO_ROOT.resolve())
+    _key = (os.environ.get("PROXYAPP_API_KEY") or "").strip()
+    if _key:
+        logger.info("[PROXY_START] PROXYAPP_API_KEY is set (%s chars); remote Bearer auth enabled", len(_key))
+    else:
+        logger.warning(
+            "[PROXY_START] PROXYAPP_API_KEY is unset — remote clients get 401 on /v1/chat/completions and /v1/responses "
+            "(loopback/docker-bridge bypass unchanged). Use proxy/start_proxy.sh or export PROXYAPP_API_KEY."
+        )
     
     # Detect Docker command (check if sudo is needed)
     # First check environment variable (set by start_proxy.sh or demo script)
@@ -228,17 +285,18 @@ async def main():
                     logger.error(f"[DIAG] [BG_LOAD] Error reading preload models from config: {e}, using fallback")
                 loaded_models = []
 
-                # Launch preload loads concurrently so one slow model doesn't block others
-                load_tasks = {}
+                # Load preload models SEQUENTIALLY to avoid GPU memory contention when multiple
+                # vLLM models share the same GPU (e.g. Nemotron + Hermes). Concurrent loads can
+                # cause OOM or allocation failures as both race for VRAM.
+                results_by_model = {}
                 for model_id in critical_models:
-                    logger.info(f"[DIAG] [BG_LOAD] Loading (async) {model_id}...")
-                    load_tasks[model_id] = loop.run_in_executor(None, proxy.model_manager.load_model, model_id)
-
-                # Await all load tasks
-                load_results = await asyncio.gather(*load_tasks.values(), return_exceptions=True)
-
-                # Map results back to model ids
-                results_by_model = dict(zip(load_tasks.keys(), load_results))
+                    logger.info(f"[DIAG] [BG_LOAD] Loading (sequential) {model_id}...")
+                    try:
+                        result = await loop.run_in_executor(None, proxy.model_manager.load_model, model_id)
+                        results_by_model[model_id] = result
+                    except Exception as e:
+                        logger.error(f"[DIAG] [BG_LOAD] Exception starting {model_id}: {e}")
+                        results_by_model[model_id] = e
 
                 # Spawn readiness waiters for successful starts
                 readiness_tasks = {}

@@ -78,7 +78,7 @@ class MemoryManager:
         while self._monitoring:
             try:
                 stats = self.get_memory_stats()
-                logger.debug(f"[MEM] Memory: {stats.used_gb}GB/{stats.total_gb}GB ({stats.utilization_percent}%)")
+                # logger.debug(f"[MEM] Memory: {stats.used_gb}GB/{stats.total_gb}GB ({stats.utilization_percent}%)")
 
                 if stats.utilization_percent > self.threshold_percent:
                     now = time.time()
@@ -87,7 +87,7 @@ class MemoryManager:
                         self._last_threshold_warning_ts = now
                     await self._evict_least_used_model()
                 else:
-                    logger.debug(f"[MEM] ✓ Memory within limits: {stats.utilization_percent}%")
+                    pass  # Disabled: logger.debug(f"[MEM] ✓ Memory within limits: {stats.utilization_percent}%")
 
             except Exception as e:
                 logger.error(f"[MEM] Error in memory monitoring: {e}")

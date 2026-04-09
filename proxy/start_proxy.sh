@@ -27,6 +27,19 @@ if [ -f "$REPO_ROOT/.env" ]; then
     set +a
 fi
 
+# Same secret is often only in OPENAI_API_KEY (OpenWebUI / BYOK); use it if PROXYAPP_* not set.
+PROXYAPP_API_KEY="${PROXYAPP_API_KEY:-${OPENAI_API_KEY:-}}"
+export PROXYAPP_API_KEY
+
+if [ -z "${PROXYAPP_API_KEY}" ] && [ "${PROXY_ALLOW_NO_API_KEY:-}" != "1" ]; then
+    echo -e "${RED}Error: PROXYAPP_API_KEY is not set after loading ${REPO_ROOT}/.env${NC}"
+    echo -e "${YELLOW}Remote clients (Factory CLI, Droid, Tailscale) will get 401 until the proxy and client use the same key.${NC}"
+    echo -e "${YELLOW}Set in .env: PROXYAPP_API_KEY=<secret> (or OPENAI_API_KEY=… — start_proxy copies it across).${NC}"
+    echo -e "${YELLOW}See: ${REPO_ROOT}/env.example${NC}"
+    echo -e "${YELLOW}Local-only escape hatch: PROXY_ALLOW_NO_API_KEY=1 (not for production).${NC}"
+    exit 1
+fi
+
 # Configuration
 PROXY_PORT=${PROXY_PORT:-52415}
 MEMORY_THRESHOLD=${MEMORY_THRESHOLD:-0.90}
@@ -85,6 +98,11 @@ echo -e "  Proxy Port: $PROXY_PORT"
 echo -e "  Memory Threshold: $MEMORY_THRESHOLD"
 echo -e "  Load Initial Models: $LOAD_INITIAL"
 echo -e "  Models Config: $MODELS_CONFIG"
+if [ -n "${PROXYAPP_API_KEY}" ]; then
+    echo -e "  ${GREEN}PROXYAPP_API_KEY: set (${#PROXYAPP_API_KEY} chars)${NC}"
+else
+    echo -e "  ${YELLOW}PROXYAPP_API_KEY: empty (remote auth off for non-loopback)${NC}"
+fi
 echo ""
 
 # Detect Docker command if not provided (for background mode)
@@ -113,11 +131,20 @@ fi
 
 # Run proxy server
 if [ "${BACKGROUND:-false}" = "true" ]; then
-    nohup setsid env DOCKER_CMD="$DOCKER_CMD" PYTHONPATH="$SCRIPT_DIR/src" "${BASE_CMD[@]}" > "$LOG_FILE" 2>&1 &
+    # Python logs to LOG_FILE via FileHandler; do not redirect process stdout to the same path
+    # (truncation / double-writer races). Capture shell-level noise separately.
+    STDIO_LOG="$LOG_DIR/proxy_stdio.log"
+    # Pass API key explicitly: some nohup/setsid/cron paths do not inherit a sourced .env reliably.
+    nohup setsid env \
+        DOCKER_CMD="$DOCKER_CMD" \
+        PYTHONPATH="$SCRIPT_DIR/src" \
+        PROXYAPP_API_KEY="$PROXYAPP_API_KEY" \
+        "${BASE_CMD[@]}" >> "$STDIO_LOG" 2>&1 &
     proxy_pid=$!
     echo $proxy_pid > "$PID_FILE"
     echo "Proxy server started in background (PID: $proxy_pid)"
     echo "Logs: $LOG_FILE"
+    echo "Python stderr/uncaught (if any): $STDIO_LOG"
 else
-    env DOCKER_CMD="$DOCKER_CMD" PYTHONPATH="$SCRIPT_DIR/src" "${BASE_CMD[@]}" 2>&1 | tee "$LOG_FILE"
+    env DOCKER_CMD="$DOCKER_CMD" PYTHONPATH="$SCRIPT_DIR/src" PROXYAPP_API_KEY="$PROXYAPP_API_KEY" "${BASE_CMD[@]}" 2>&1 | tee "$LOG_FILE"
 fi

@@ -17,7 +17,7 @@ WATCHDOG_AUTOSTART="${WATCHDOG_AUTOSTART:-false}"  # if true, watchdog may resta
 MAX_LOAD_TIME=900        # 15 minutes for model loading
 MAX_INFERENCE_TIME=900   # 15 minutes for inference requests
 MAX_STREAMING_IDLE=300   # 5 minutes streaming inactivity
-MONITOR_INTERVAL=30      # Check every 30 seconds
+MONITOR_INTERVAL="${MONITOR_INTERVAL:-180}"  # Default 3 minutes; override env MONITOR_INTERVAL
 RESTART_GRACE_PERIOD=60  # Wait 60s after restart before monitoring
 STARTUP_GRACE_PERIOD=180 # Ignore WebUI/container health during initial startup window
 
