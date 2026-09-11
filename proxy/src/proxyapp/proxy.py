@@ -6,17 +6,24 @@ Manages model lifecycle and request queueing
 """
 
 import asyncio
+import copy
 import logging
+import sqlite3
 import json
+import re
 import time
 import os
+import base64
 import traceback
 from collections import defaultdict
 from threading import Lock
 from pathlib import Path
-from typing import Dict, Optional, List, Any, Callable, NamedTuple
+from typing import Dict, Optional, List, Any, Callable, NamedTuple, Mapping, Tuple
 from aiohttp import web, ClientSession, ClientError
 from aiohttp.web import Request, Response
+import urllib.parse
+import urllib.request
+import secrets
 
 # Resolve repo root more robustly for both host and container environments
 _current_file = Path(__file__).resolve()
@@ -32,10 +39,14 @@ else:
         # Fallback if path resolution fails
         REPO_ROOT = Path.cwd()
 
-from .model_manager import ModelManager, ModelBackend
+from .model_manager import manage_containers_enabled,  ModelManager, ModelBackend
 from .memory_manager import MemoryManager
 from .request_queue import RequestQueue
 from .chat_history_db import ChatHistoryDB
+from .hud_store import HUDStore
+from .hud_workers import HUDWorkers
+from .hud_adapters import HUDAdapterHub
+from .hud_sync import build_brief_sync_report, build_sync_status_payload
 from .sanitizers.reasoning_xml import ReasoningXmlSanitizer
 from .prompt_admission import (
     admission_class_slot,
@@ -72,6 +83,38 @@ from .streaming.production_audit import (
     normalization_delta,
     sse_audit_comment_enabled,
 )
+from .contracts.hud import (
+    HUD_ERROR_HTTP_STATUS,
+    HUD_INTENT_BRIEF,
+    HUD_INTENT_INGEST,
+    HUD_INTENT_PROJECT,
+    HUD_INTENT_MCP,
+    HUD_INTENT_STATUS,
+    HUD_INTENT_SYNC_STATUS,
+    HUD_INTENT_ONBOARDING_READ_SOUL,
+    HUD_INTENT_ONBOARDING_WRITE_SOUL,
+    HUD_INTENT_DELETE_USER_PROJECTION_MODE,
+    HUD_INTENT_SET_PUSH_POLICY,
+    HUD_MCP_METHODS,
+    HUD_ROUTE_INGEST,
+    HUD_ROUTE_MCP,
+    HUD_ROUTE_ONBOARDING_SOUL,
+    HUD_ROUTE_PUSH_POLICY,
+    HUD_ROUTE_PROJECT,
+    HUD_ROUTE_BRIEF,
+    HUD_ROUTE_STATUS_COMPAT,
+    HUD_ROUTE_SYNC_STATUS,
+    HUD_DEFAULT_PROJECTION_MODE,
+    HUD_PROJECTION_MODE_DRY_RUN,
+    HUD_PROJECTION_MODE_LIVE,
+    normalize_projection_mode,
+    parse_projection_mode,
+    hud_error_payload,
+    hud_success_payload,
+    parse_hud_scope,
+    require_json,
+    validate_hud_id,
+)
 from .tracing import (
     get_or_create_request_id,
     log_backend_request_payload,
@@ -95,6 +138,60 @@ from .tracing import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Strip Factory / client-emitted <thinking> blobs from assistant content before vLLM forward only.
+# Matches non-greedy so multiple blocks are removed; does not move text into reasoning_content.
+_ASSISTANT_THINKING_BLOCK_RE = re.compile(
+    r"<thinking>\s*.*?\s*</thinking>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def normalize_vllm_forward_messages_strip_assistant_thinking(messages: Any) -> int:
+    """Remove raw ``<thinking>...</thinking>`` spans from assistant ``content`` (vLLM request only).
+
+    Leaves ``tool_calls`` unchanged. Empty content becomes ``None``. Returns count of assistant
+    messages rewritten.
+    """
+    if not isinstance(messages, list):
+        return 0
+    n_changed = 0
+    for idx, msg in enumerate(messages):
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        changed = False
+        if isinstance(content, str):
+            new_s, count = _ASSISTANT_THINKING_BLOCK_RE.subn("", content)
+            new_s = new_s.strip()
+            if count:
+                changed = True
+                msg["content"] = new_s if new_s else None
+        elif isinstance(content, list):
+            new_parts: List[Any] = []
+            stripped_any = False
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    t = part.get("text")
+                    if isinstance(t, str):
+                        new_t, count = _ASSISTANT_THINKING_BLOCK_RE.subn("", t)
+                        new_t = new_t.strip()
+                        if count:
+                            stripped_any = True
+                        if new_t:
+                            new_parts.append({**part, "text": new_t})
+                        continue
+                new_parts.append(part)
+            if stripped_any:
+                changed = True
+                msg["content"] = new_parts if new_parts else None
+        if changed:
+            n_changed += 1
+            logger.info(
+                "[history_normalize] stripped thinking block from assistant message index=%s",
+                idx,
+            )
+    return n_changed
 
 
 class _ReadinessProbeResult(NamedTuple):
@@ -174,8 +271,49 @@ def normalize_openai_chat_request(body: dict, audit_meta: Optional[dict] = None)
     return normalized
 
 
+def normalize_assistant_message_reasoning_channels_inplace(msg: dict) -> None:
+    """Collapse native ``reasoning`` / ``reasoning_content`` to one ``reasoning_content`` (prefer content field)."""
+    if not isinstance(msg, dict):
+        return
+    rc = msg.get("reasoning_content")
+    rr = msg.get("reasoning")
+    rc_s = rc if isinstance(rc, str) and rc else ""
+    rr_s = rr if isinstance(rr, str) and rr else ""
+    msg.pop("reasoning", None)
+    msg.pop("reasoning_content", None)
+    if rc_s:
+        msg["reasoning_content"] = rc_s
+    elif rr_s:
+        msg["reasoning_content"] = rr_s
+
+
+def normalize_outbound_chat_delta(
+    delta: dict,
+    *,
+    sanitizer_reasoning_delta: Optional[str] = None,
+) -> dict:
+    """Single outbound reasoning channel: ``reasoning_content`` only. Prefer sanitizer slice when non-empty."""
+    if not isinstance(delta, dict):
+        return delta
+    native_rc = delta.get("reasoning_content")
+    native_r = delta.get("reasoning")
+    native = ""
+    if isinstance(native_rc, str) and native_rc:
+        native = native_rc
+    elif isinstance(native_r, str) and native_r:
+        native = native_r
+    sr = sanitizer_reasoning_delta if isinstance(sanitizer_reasoning_delta, str) else None
+    canonical = (sr if sr else None) or (native if native else None)
+    out = dict(delta)
+    out.pop("reasoning", None)
+    out.pop("reasoning_content", None)
+    if canonical:
+        out["reasoning_content"] = canonical
+    return out
+
+
 def normalize_vllm_chat_completion_response(body: dict) -> dict:
-    """If the assistant message has empty ``content`` but reasoning text, copy reasoning into ``content``."""
+    """Normalize reasoning fields; if assistant ``content`` is empty, copy canonical reasoning into ``content``."""
     out = json.loads(json.dumps(body))
     for ch in out.get("choices") or []:
         if not isinstance(ch, dict):
@@ -183,14 +321,89 @@ def normalize_vllm_chat_completion_response(body: dict) -> dict:
         msg = ch.get("message")
         if not isinstance(msg, dict):
             continue
+        normalize_assistant_message_reasoning_channels_inplace(msg)
         c = msg.get("content")
         rc = msg.get("reasoning_content")
-        if rc is None:
-            rc = msg.get("reasoning")
         if c is None or (isinstance(c, str) and c == ""):
             if isinstance(rc, str) and rc:
                 msg["content"] = rc
     return out
+
+
+def _coerce_chat_delta_content_to_str(val: Any) -> Optional[str]:
+    """Flatten streaming delta ``content`` to a string for sanitizer + raw audit (OpenAI multipart)."""
+    if isinstance(val, str):
+        return val if val else None
+    if isinstance(val, list):
+        parts: list[str] = []
+        for item in val:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif isinstance(item.get("content"), str):
+                parts.append(item["content"])
+        return "".join(parts) if parts else None
+    return None
+
+
+_FACTORY_NAMED_CLOSE_PRE = re.compile(r"</function\s*=\s*([^>\s]+)\s*>", re.IGNORECASE | re.DOTALL)
+
+
+def _rejoin_factory_xml_from_stripped_audit(fragments: list[dict[str, Any]]) -> str:
+    """Rebuild parseable Factory XML from sanitizer ``factory_function_stripped`` rows.
+
+    The lexer drops the opening ``<function=name>`` from its buffer before EOF close; audit ``pre_utf8``
+    holds inner markup through the named close. Restore the opener so ``extract_promotable_tool_calls_from_raw``
+    matches the non-stream promotion path.
+    """
+    pieces: list[str] = []
+    for f in fragments:
+        if not isinstance(f, dict) or f.get("kind") != "factory_function_stripped":
+            continue
+        raw = f.get("pre_utf8")
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        lead = raw.lstrip()
+        if lead.lower().startswith("<function="):
+            pieces.append(raw)
+            continue
+        m = _FACTORY_NAMED_CLOSE_PRE.search(raw)
+        if m:
+            name = m.group(1).strip()
+            pieces.append(f"<function={name}>" + raw)
+        else:
+            pieces.append(raw)
+    return "".join(pieces)
+
+
+def _try_eof_factory_promotion(
+    *,
+    sanitizer_fragments: list[dict[str, Any]],
+    had_backend_tool_delta: bool,
+    finish_reason: Optional[str],
+    openai_chat_request: dict,
+) -> list[dict[str, Any]] | None:
+    if had_backend_tool_delta:
+        return None
+    if finish_reason != "stop":
+        return None
+    if not should_try_xml_tool_promotion(openai_chat_request):
+        return None
+    stripped = [
+        f
+        for f in sanitizer_fragments
+        if isinstance(f, dict)
+        and f.get("kind") == "factory_function_stripped"
+        and (f.get("pre_utf8") or "").strip()
+    ]
+    if not stripped:
+        return None
+    raw_xml = _rejoin_factory_xml_from_stripped_audit(stripped)
+    tool_calls, _prefix = extract_promotable_tool_calls_from_raw(raw_xml)
+    if not tool_calls:
+        return None
+    return tool_calls
 
 
 def maybe_promote_nemotron_tools_in_completion(body: dict, openai_request: dict) -> dict:
@@ -281,9 +494,28 @@ def _responses_reasoning_commit_index(buf: str) -> int:
 _LIST_MODELS_LOG_INTERVAL_S = 180.0
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name, "1" if default else "0").strip().lower()
+    return value in {"1", "true", "yes", "on", "y"}
+
+
 class UnifiedProxy:
     """Unified API proxy for vLLM and llama.cpp models"""
-    
+
+    _HUD_TERMINAL_STATUSES = {"approved", "rejected", "failed", "duplicate", "synced"}
+    _HUD_PROJECTION_DISPATCH_STATUSES = {"queued", "approved"}
+    _HUD_MCP_UNGATED_ONBOARDING_METHODS = frozenset(
+        {"hud.onboarding.read_soul", "hud.onboarding.write_soul"}
+    )
+    _HUD_MCP_EXEMPT_PUSH_POLICY_METHODS = frozenset(
+        {
+            "hud.onboarding.read_soul",
+            "hud.onboarding.write_soul",
+            "hud.set_push_policy",
+            "hud.delete_user_projection_mode",
+        }
+    )
+
     def __init__(
         self,
         proxy_port: int = 52415,
@@ -332,6 +564,15 @@ class UnifiedProxy:
         if db_path is None:
             db_path = "data/history.db"
         self.chat_history = ChatHistoryDB(db_path=db_path)
+        hud_db_path = os.environ.get("HUD_DB_PATH", "data/hud.db")
+        self.hud_store = HUDStore(db_path=hud_db_path)
+        self.hud_workers = HUDWorkers()
+        self.hud_allow_writes = _env_bool("HUD_ALLOW_WRITES", False)
+        self.hud_allow_google_writes = _env_bool("HUD_ALLOW_GOOGLE_WRITES", self.hud_allow_writes)
+        self.hud_adapter_hub = HUDAdapterHub(
+            allow_writes=self.hud_allow_writes,
+            allow_google_writes=self.hud_allow_google_writes,
+        )
         
         # Start background tasks
         self._monitoring_task = None
@@ -913,24 +1154,29 @@ class UnifiedProxy:
         if not isinstance(msg, dict):
             return
         content = msg.get("content")
-        if not isinstance(content, str) or not content:
-            return
-        san = ReasoningXmlSanitizer()
-        r1, v1 = san.feed_content(content)
-        r2, v2 = san.finalize()
-        reasoning_chunks = [x for x in (r1, r2) if x]
-        vis_chunks = [x for x in (v1, v2) if x]
-        if reasoning_chunks:
-            prev = msg.get("reasoning_content")
-            extra = "".join(reasoning_chunks)
-            if isinstance(prev, str) and prev:
-                msg["reasoning_content"] = prev + extra
+        if isinstance(content, str) and content:
+            san = ReasoningXmlSanitizer()
+            r1, v1 = san.feed_content(content)
+            r2, v2 = san.finalize()
+            reasoning_chunks = [x for x in (r1, r2) if x]
+            vis_chunks = [x for x in (v1, v2) if x]
+            if reasoning_chunks:
+                prev = msg.get("reasoning_content")
+                extra = "".join(reasoning_chunks)
+                if isinstance(prev, str) and prev:
+                    msg["reasoning_content"] = prev + extra
+                else:
+                    msg["reasoning_content"] = extra
+            if vis_chunks:
+                msg["content"] = "".join(vis_chunks)
             else:
-                msg["reasoning_content"] = extra
-        if vis_chunks:
-            msg["content"] = "".join(vis_chunks)
-        else:
-            msg["content"] = ""
+                msg["content"] = ""
+        normalize_assistant_message_reasoning_channels_inplace(msg)
+        c = msg.get("content")
+        rc = msg.get("reasoning_content")
+        if c is None or (isinstance(c, str) and c == ""):
+            if isinstance(rc, str) and rc:
+                msg["content"] = rc
 
     def _note_tool_runtime_from_messages(self, request: Optional[Request], messages: Any, route: str) -> None:
         if not isinstance(messages, list) or not messages:
@@ -1056,6 +1302,10 @@ class UnifiedProxy:
                     "/v1/models",
                     "/v1/chat/completions/models",
                     "/v1/responses/models",
+                    "/openapi.json",   # MCP discovery - protected by its own HUD admin key
+                    "/hud",            # MCP paths - protected by its own HUD admin key
+                    "/rest/oauth2-credential/callback",  # OAuth callback - browser redirect target
+                    "/oauth/google/reconnect-status",  # INTERIM: OpenAPI tool path - proxy auth refactor pending
                 ]
                 if any(request.path.startswith(path) for path in public_paths):
                     return await handler(request)
@@ -1112,6 +1362,7 @@ class UnifiedProxy:
             logger.info("[DIAG] [PROXY.START] Registering API endpoints...")
             app.router.add_get("/healthcheck", self.healthcheck)
             app.router.add_get("/watchdog/status", self.watchdog_status)
+            # openapi.json served via _hud_forward → agent-service (authoritative HUD spec)
             app.router.add_get("/v1/models", self.list_models)
 
             # Model discovery endpoints for n8n Chat Hub compatibility
@@ -1137,7 +1388,21 @@ class UnifiedProxy:
             app.router.add_post("/v1/models/{model_id}/unload", self.unload_model)
             app.router.add_get("/v1/models/{model_id}/status", self.model_status)
             logger.info("[DIAG] [PROXY.START] ✓ Model management endpoints registered")
+
+            # HUD: relay-only to agent-service (business logic lives on :8001)
+            # OAuth reconnect & callback routes stay local on proxy
+            app.router.add_get("/oauth/google/reauth-link", self.google_reauth_link)
+            app.router.add_get("/rest/oauth2-credential/callback", self.google_oauth_callback)
+            app.router.add_get("/oauth/google/reconnect-status", self.google_reconnect_status)
+            logger.info("[DIAG] [PROXY.START] ✓ HUD relay-only (no local business handlers)")
+            # HUD relay to agent-service container (v1.4 wiring)
+            app.router.add_route("*", "/hud/{tail:.*}", self._hud_forward)
+            app.router.add_get("/openapi.json", self._hud_forward)
+            logger.info("[DIAG] [PROXY.START] ✓ HUD OAI API MCP relay registered (/hud/* + /openapi.json → localhost:8001)")
             
+            # OAuth state nonce store (in-memory, for reconnect link state validation)
+            self._oauth_state_store: Dict[str, Dict[str, Any]] = {}
+
             # Start background monitoring
             logger.info("[DIAG] [PROXY.START] Starting background tasks...")
             self.memory_manager.start_monitoring()
@@ -1162,6 +1427,28 @@ class UnifiedProxy:
             logger.error(f"[DIAG] [PROXY.START] ✗ EXCEPTION in start(): {e}", exc_info=True)
             raise
     
+    async def _hud_forward(self, request):
+        """Forward /openapi.json and /hud/* to the agent-service container on 8001."""
+        if request.path == "/hud/health":
+            target_path = "/health"
+        elif request.path == "/openapi.json":
+            target_path = "/openapi.json"
+        else:
+            target_path = request.path
+        qs = f"?{request.query_string}" if request.query_string else ""
+        target = f"http://localhost:8001{target_path}{qs}"
+        method = request.method
+        headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length", "connection")}
+        data = await request.read() if request.can_read_body else None
+        from aiohttp import ClientSession, web
+        try:
+            async with ClientSession() as session:
+                async with session.request(method, target, headers=headers, data=data) as resp:
+                    body = await resp.read()
+                    return web.Response(body=body, status=resp.status)
+        except Exception as e:
+            return web.json_response({"error": "HUD relay error", "detail": str(e)}, status=502)
+
     async def healthcheck(self, request: Request) -> Response:
         """Health check endpoint"""
         return web.json_response({
@@ -1174,6 +1461,474 @@ class UnifiedProxy:
             )
         })
     
+    async def google_reauth_link(self, request: Request) -> Response:
+        """GET /oauth/google/reauth-link: Return Google OAuth URL if reauth is required."""
+        actor = self._hud_actor(request)
+        data_dir = REPO_ROOT / "data"
+        creds_file = data_dir / "gOAuth1.json"
+        token_file = data_dir / "gOAuth1.token.json"
+
+        # Check if reauth is required
+        reauth_needed = False
+        if token_file.is_file():
+            try:
+                token_data = json.loads(token_file.read_text(encoding="utf-8"))
+                reauth_needed = bool(token_data.get("reauth_required", False))
+                if not token_data.get("refresh_token"):
+                    reauth_needed = True
+            except (OSError, json.JSONDecodeError):
+                reauth_needed = True
+        else:
+            reauth_needed = True
+
+        if not reauth_needed:
+            return web.json_response({
+                "status": "ok",
+                "reauth_required": False,
+            })
+
+        # Read credentials
+        if not creds_file.is_file():
+            return web.json_response(
+                {"status": "error", "message": "OAuth credentials file not found"},
+                status=500,
+            )
+
+        try:
+            creds_raw = json.loads(creds_file.read_text(encoding="utf-8"))
+            web_section = creds_raw.get("web", creds_raw)
+            client_id = web_section.get("client_id", "")
+            redirect_uris = web_section.get("redirect_uris", [])
+            redirect_uri = redirect_uris[0] if redirect_uris else ""
+            if not client_id or not redirect_uri:
+                return web.json_response(
+                    {"status": "error", "message": "Invalid OAuth credentials"},
+                    status=500,
+                )
+        except (OSError, json.JSONDecodeError) as exc:
+            return web.json_response(
+                {"status": "error", "message": f"Failed to read credentials: {exc}"},
+                status=500,
+            )
+
+        # Generate state nonce
+        state_nonce = secrets.token_hex(16)
+        self._oauth_state_store[state_nonce] = {
+            "created_at": time.time(),
+        }
+
+        # Build Google OAuth URL with access_type=offline + prompt=consent
+        scopes = [
+            "https://www.googleapis.com/auth/calendar",
+            "https://www.googleapis.com/auth/tasks",
+        ]
+        params = {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "scope": " ".join(scopes),
+            "response_type": "code",
+            "access_type": "offline",
+            "prompt": "consent",
+            "state": state_nonce,
+        }
+        auth_url = f"https://accounts.google.com/o/oauth2/auth?{urllib.parse.urlencode(params)}"
+
+        return web.json_response({
+            "status": "ok",
+            "reauth_required": True,
+            "url": auth_url,
+            "state": state_nonce,
+        })
+
+
+    async def google_oauth_callback(self, request: Request) -> Response:
+        """GET /rest/oauth2-credential/callback: Exchange OAuth code for tokens."""
+        query = request.query
+        code = query.get("code", "")
+        state = query.get("state", "")
+        error = query.get("error", "")
+
+        if error:
+            logger.error("OAuth callback received error: %s", error)
+            return web.Response(
+                text=f"<html><body><h1>OAuth Error</h1><p>{error}</p></body></html>",
+                content_type="text/html",
+                status=400,
+            )
+
+        # Validate state nonce
+        if not state or state not in self._oauth_state_store:
+            logger.warning("OAuth callback with invalid/missing state nonce")
+            return web.Response(
+                text="<html><body><h1>Auth Error</h1><p>Invalid state parameter. Please retry from the application.</p></body></html>",
+                content_type="text/html",
+                status=400,
+            )
+        self._oauth_state_store.pop(state, {})
+
+        if not code:
+            return web.Response(
+                text="<html><body><h1>Auth Error</h1><p>Missing authorization code.</p></body></html>",
+                content_type="text/html",
+                status=400,
+            )
+
+        # Read client credentials for token exchange
+        data_dir = REPO_ROOT / "data"
+        creds_file = data_dir / "gOAuth1.json"
+        token_file = data_dir / "gOAuth1.token.json"
+
+        try:
+            creds_raw = json.loads(creds_file.read_text(encoding="utf-8"))
+            web_section = creds_raw.get("web", creds_raw)
+            client_id = web_section.get("client_id", "")
+            client_secret = web_section.get("client_secret", "")
+            redirect_uris = web_section.get("redirect_uris", [])
+            redirect_uri = redirect_uris[0] if redirect_uris else ""
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.error("Failed to read OAuth credentials for callback: %s", exc)
+            return web.Response(
+                text="<html><body><h1>Server Error</h1><p>Configuration error.</p></body></html>",
+                content_type="text/html",
+                status=500,
+            )
+
+        # Exchange code for tokens
+        token_url = "https://oauth2.googleapis.com/token"
+        form_data = urllib.parse.urlencode({
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": redirect_uri,
+        }).encode("utf-8")
+
+        try:
+            req = urllib.request.Request(
+                token_url,
+                data=form_data,
+                headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                raw = resp.read().decode("utf-8")
+                token_result = json.loads(raw)
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            logger.error("OAuth token exchange HTTP %s: %s", exc.code, body)
+            return web.Response(
+                text=f"<html><body><h1>Token Exchange Failed</h1><p>Google returned HTTP {exc.code}. Check credentials and redirect URI.</p></body></html>",
+                content_type="text/html",
+                status=502,
+            )
+        except Exception as exc:
+            logger.error("OAuth token exchange failed: %s", exc)
+            return web.Response(
+                text="<html><body><h1>Token Exchange Failed</h1><p>Could not contact Google.</p></body></html>",
+                content_type="text/html",
+                status=502,
+            )
+
+        # Build normalized token payload
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        token_payload = {
+            "access_token": token_result.get("access_token", ""),
+            "token_uri": token_url,
+            "scopes": [
+                "https://www.googleapis.com/auth/calendar",
+                "https://www.googleapis.com/auth/tasks",
+            ],
+            "token_type": token_result.get("token_type", "Bearer"),
+            "reauth_required": False,
+            "last_refresh_ok_at": now.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        }
+        if token_result.get("refresh_token"):
+            token_payload["refresh_token"] = token_result["refresh_token"]
+        else:
+            token_payload["refresh_token"] = ""
+        expires_in = token_result.get("expires_in", 3600)
+        expiry_dt = now + timedelta(seconds=int(expires_in))
+        token_payload["expires_at"] = expiry_dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        token_payload["token_expiry"] = token_payload["expires_at"]
+
+        # Persist token (encrypt refresh_token at rest)
+        try:
+            import sys
+            hud_root = str(REPO_ROOT / "AdventedHUD")
+            if hud_root not in sys.path:
+                sys.path.insert(0, hud_root)
+            from hud.adapters import _persist_google_token_file
+            _persist_google_token_file(token_file, token_payload)
+            logger.info("OAuth callback succeeded — tokens refreshed for newnew2 project")
+        except OSError as exc:
+            logger.error("Failed to persist OAuth token: %s", exc)
+            return web.Response(
+                text="<html><body><h1>Server Error</h1><p>Failed to save token.</p></body></html>",
+                content_type="text/html",
+                status=500,
+            )
+
+        return web.Response(
+            text="<html><body><h1>Authorization Successful</h1><p>Google Calendar + Tasks reauthentication complete. You can close this window.</p></body></html>",
+            content_type="text/html",
+        )
+
+
+    async def google_reconnect_status(self, request: Request) -> Response:
+        """GET /oauth/google/reconnect-status: MCP-facing reconnect status tool."""
+        actor = self._hud_actor(request)
+        data_dir = REPO_ROOT / "data"
+        token_file = data_dir / "gOAuth1.token.json"
+
+        reauth_required = True
+        if token_file.is_file():
+            try:
+                token_data = json.loads(token_file.read_text(encoding="utf-8"))
+                reauth_required = bool(token_data.get("reauth_required", False))
+                if not token_data.get("refresh_token"):
+                    reauth_required = True
+            except (OSError, json.JSONDecodeError):
+                reauth_required = True
+
+        if not reauth_required:
+            return web.json_response({
+                "status": "ok",
+                "connected": True,
+                "reauth_required": False,
+            })
+
+        # Generate reauth URL via the existing method
+        reauth_resp = await self.google_reauth_link(request)
+        reauth_body = json.loads(reauth_resp.body)
+        url = reauth_body.get("url", "") if isinstance(reauth_body, dict) else ""
+
+        return web.json_response({
+            "status": "ok",
+            "connected": False,
+            "reauth_required": True,
+            "reauth_url": url,
+        })
+
+    async def openapi_spec(self, request: Request) -> Response:
+        """Return OpenAPI contract exposing HUD operations for tool discovery."""
+        return web.json_response({
+            "openapi": "3.1.0",
+            "info": {
+                "title": "Unified Proxy HUD Contract",
+                "version": "1.0.0",
+            },
+            "paths": {
+                "/hud/ingest": {
+                    "post": {
+                        "operationId": "hud_ingest",
+                        "summary": "Ingest a HUD item and persist to queue (optionally project)",
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "text": {
+                                                "type": "string",
+                                                "description": "The content or description of the item to ingest"
+                                            },
+                                            "google_target": {
+                                                "type": "string",
+                                                "enum": ["obsidian", "calendar", "tasks"],
+                                                "description": "Where to project: obsidian (default, store locally), calendar (Google Calendar event), tasks (Google Tasks todo)"
+                                            },
+                                            "semantic_type": {
+                                                "type": "string",
+                                                "enum": ["event", "todo", "note"],
+                                                "description": "Classification: event (time-bound), todo (actionable), note (reflection)"
+                                            },
+                                            "priority_class": {
+                                                "type": "string",
+                                                "enum": ["critical", "high", "medium", "low", "normal"],
+                                                "description": "Priority per FranklinCovey decision matrix from hud.brief"
+                                            },
+                                            "intent": {
+                                                "type": "string",
+                                                "default": "ingest",
+                                                "description": "Operation intent: ingest, classify, project, brief, mcp"
+                                            },
+                                            "scope": {
+                                                "type": "string",
+                                                "description": "Scope: today, week, or free-form for item grouping"
+                                            },
+                                            "role_ref": {
+                                                "type": "string",
+                                                "description": "Role slug or name from soul.md roles list (from hud.brief)"
+                                            },
+                                            "goal_ref": {
+                                                "type": "string",
+                                                "description": "Goal slug or name from goals_by_role (from hud.brief)"
+                                            },
+                                            "requires_approval": {
+                                                "type": "boolean",
+                                                "description": "True if this item needs approval before projecting to external adapter"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {"200": {"description": "Ingestion result with classification and projection metadata"}},
+                    }
+                },
+                "/hud/brief": {
+                    "post": {
+                        "operationId": "hud_brief",
+                        "summary": "Get current queued HUD brief",
+                        "responses": {"200": {"description": "Brief payload"}},
+                    }
+                },
+                "/hud/onboarding/soul": {
+                    "get": {
+                        "operationId": "hud_onboarding_soul_read",
+                        "summary": "Read canonical soul.md (worksheet + current answers) for onboarding interview",
+                        "responses": {
+                            "200": {
+                                "description": "Current file body, path, exists flag, and onboarding gate status",
+                            },
+                        },
+                    },
+                    "post": {
+                        "operationId": "hud_onboarding_soul",
+                        "summary": "Write canonical soul.md (mission/roles/goals) to complete onboarding",
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "markdown": {"type": "string", "description": "Full soul.md body"},
+                                            "content": {"type": "string"},
+                                            "body": {"type": "string"},
+                                            "text": {"type": "string"},
+                                        },
+                                    }
+                                }
+                            },
+                        },
+                        "responses": {
+                            "200": {"description": "Written; includes refreshed onboarding status"},
+                            "400": {"description": "Invalid or empty body"},
+                        },
+                    },
+                },
+                "/hud/sync_status": {
+                    "post": {
+                        "operationId": "hud_sync_status",
+                        "summary": "Get HUD sync status with optional filters",
+                        "responses": {"200": {"description": "Status payload"}},
+                    },
+                },
+                "/hud/project": {
+                    "post": {
+                        "operationId": "hud_project",
+                        "summary": "Evaluate projection result for deterministic HUD workflow output",
+                        "requestBody": {
+                            "required": True,
+                            "content": {"application/json": {"schema": {"type": "object"}}},
+                        },
+                        "responses": {"200": {"description": "Projection payload"}},
+                    }
+                },
+                "/hud/status": {
+                    "post": {
+                        "operationId": "hud_status",
+                        "summary": "Compatibility alias for hud_sync_status",
+                        "responses": {"200": {"description": "Status payload"}},
+                    },
+                    "get": {
+                        "operationId": "hud_status_get",
+                        "summary": "Compatibility alias for hud_sync_status",
+                        "responses": {"200": {"description": "Status payload"}},
+                    },
+                },
+                "/hud/mcp": {
+                    "post": {
+                        "operationId": "hud_mcp",
+                        "summary": "Execute HUD MCP intent",
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {"type": "object"}
+                                }
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "MCP result payload",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {"type": "object"}
+                                    }
+                                }
+                            }
+                        },
+                    }
+                },
+                "/hud/push_policy": {
+                    "post": {
+                        "operationId": "hud_set_push_policy",
+                        "summary": "Set whether HUD may push items to external services without per-item approval",
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "external_push_without_approval": {
+                                                "type": "boolean",
+                                                "description": "true = push directly without approval, false = require approval per item"
+                                            }
+                                        },
+                                        "required": ["external_push_without_approval"]
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {
+                            "200": {"description": "Push policy set successfully"},
+                            "400": {"description": "Invalid or missing external_push_without_approval"},
+                            "409": {"description": "Onboarding not complete"}
+                        }
+                    }
+                },
+                "/oauth/google/reconnect-status": {
+                    "get": {
+                        "operationId": "google_oauth_reconnect_status",
+                        "summary": "Check Google OAuth reconnect status - returns connected state or reauth URL",
+                        "responses": {
+                            "200": {
+                                "description": "OAuth status",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "status": {"type": "string"},
+                                                "connected": {"type": "boolean"},
+                                                "reauth_required": {"type": "boolean"},
+                                                "reauth_url": {"type": "string"}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+            },
+        })
+
     async def list_models(self, request: Request) -> Response:
         """List all available models (aggregated from all backends)"""
         now = time.time()
@@ -1402,7 +2157,30 @@ class UnifiedProxy:
                         status=503,
                     )
                 
-                # Start loading model
+                # Inference lifecycle is Studio-only. Proxy must never start containers.
+                if not manage_containers_enabled():
+                    logger.error(
+                        "Refusing on-demand model start model=%s (PROXY_MANAGE_CONTAINERS=0; use vLLM Studio)",
+                        model_id,
+                    )
+                    return web.json_response(
+                        {
+                            "error": {
+                                "message": (
+                                    f"Model '{model_id}' is not running. "
+                                    "Proxy does not start inference containers — "
+                                    "start the model in vLLM Studio, then retry."
+                                ),
+                                "type": "studio_only_inference",
+                                "code": "inference_not_managed_by_proxy",
+                            },
+                            "output": [],
+                            "choices": [],
+                        },
+                        status=503,
+                    )
+
+                # Start loading model (legacy path; only if PROXY_MANAGE_CONTAINERS=1)
                 logger.info(f"Loading model {model_id} for request")
                 loading_started = self.model_manager.load_model(model_id)
                 
@@ -1749,6 +2527,11 @@ class UnifiedProxy:
                 model_info.status = "unloaded"
 
             if model_info.status != "loaded":
+                if not manage_containers_enabled():
+                    raise RuntimeError(
+                        f"Model '{model_id}' is not running. "
+                        "Proxy does not start inference containers — use vLLM Studio."
+                    )
                 ok = await asyncio.to_thread(self.model_manager.load_model, model_id)
                 if not ok:
                     raise RuntimeError(f"Failed to load model '{model_id}'")
@@ -2369,6 +3152,11 @@ class UnifiedProxy:
 
         model_info = self.model_manager.models[model_id]
         if model_info.status != "loaded":
+            if not manage_containers_enabled():
+                raise RuntimeError(
+                    f"Model '{model_id}' is not running. "
+                    "Proxy does not start inference containers — use vLLM Studio."
+                )
             # Start/load synchronously (may take time; keeps /responses semantics correct)
             # IMPORTANT: Model loading does blocking IO (docker, requests). Run it off the event loop.
             ok = await asyncio.to_thread(self.model_manager.load_model, model_id)
@@ -2455,7 +3243,12 @@ class UnifiedProxy:
                         "model_id": model_id
                     }
                 else:
-                    # Model needs to be loaded
+                    # Model needs to be loaded — Studio-only when manage flag is off
+                    if not manage_containers_enabled():
+                        raise RuntimeError(
+                            f"Model '{model_id}' is not running. "
+                            "Proxy does not start inference containers — use vLLM Studio."
+                        )
                     # Queue the request and start loading in background
                     request_id = self.request_queue.enqueue(
                         model_id=model_id,
@@ -2463,7 +3256,7 @@ class UnifiedProxy:
                         callback=lambda: self._forward_request(model_id, data, request)
                     )
 
-                    # Start background loading
+                    # Start background loading (legacy only)
                     self.model_manager.load_model(model_id)
 
                     return {
@@ -2732,6 +3525,11 @@ class UnifiedProxy:
         if model_info.backend == ModelBackend.VLLM:
             # vLLM uses "/app/model" as the model ID when mounting local directories
             data["model"] = "/app/model"
+            # Deep-copy messages so client_normalized history is untouched; strip hybrid
+            # <thinking>...</thinking> from assistant content to avoid reasoning-only stops.
+            if data.get("messages"):
+                data["messages"] = copy.deepcopy(data["messages"])
+                normalize_vllm_forward_messages_strip_assistant_thinking(data["messages"])
         elif model_info.backend == ModelBackend.LLAMACPP:
             # OpenCode/AI-SDK sends tool-calling fields that llama.cpp rejects unless started with --jinja.
             # For now, strip these fields so OpenCode can run against llama.cpp without requiring server flags.
@@ -3068,6 +3866,7 @@ class UnifiedProxy:
                         seq_o = 0
                         sse_tw = get_sse_trace_writer()
                         finish_reason: Optional[str] = None
+                        last_stream_chunk_id = ""
 
                         async def write_to_client(blob: bytes) -> bool:
                             await ensure_prepared()
@@ -3094,10 +3893,11 @@ class UnifiedProxy:
                                 }
 
                         async def close_stream_tail(*, emit_done: bool = True) -> bool:
-                            nonlocal seq_o
+                            nonlocal seq_o, finish_reason
                             r_tail, v_tail = sanitizer.finalize()
                             log_sanitizer_eof(rid, sanitizer.trace_state())
                             tool_audit.sanitizer_eof = sanitizer.trace_state()
+                            pa.merge_sanitizer_audit(sanitizer.take_audit_events())
                             extra_obj = None
                             if (r_tail and r_tail.strip()) or (v_tail and v_tail.strip()):
                                 extra_obj = {
@@ -3128,6 +3928,11 @@ class UnifiedProxy:
                                 if not await write_to_client(out):
                                     return False
                                 seq_o += 1
+                                ed = (extra_obj.get("choices") or [{}])[0].get("delta") or {}
+                                if ed.get("reasoning_content"):
+                                    tool_audit.note_client_reasoning(len(ed["reasoning_content"]))
+                                if ed.get("content"):
+                                    tool_audit.note_client_visible(len(ed["content"]))
                                 tool_audit.note_proxy_chat_out(extra_obj)
                                 log_proxy_outbound_delta(
                                     rid,
@@ -3137,6 +3942,54 @@ class UnifiedProxy:
                                     surface="chat.completion.chunk",
                                     emitted=canonical_backend_chat_sse(extra_obj),
                                     projection=projection_chat_outbound_event(extra_obj),
+                                )
+                            promoted = _try_eof_factory_promotion(
+                                sanitizer_fragments=pa.sanitizer_fragments,
+                                had_backend_tool_delta=had_backend_tool_delta,
+                                finish_reason=finish_reason,
+                                openai_chat_request=client_normalized,
+                            )
+                            if promoted:
+                                finish_reason = "tool_calls"
+                                eof_chunk: Dict[str, Any] = {
+                                    "id": last_stream_chunk_id,
+                                    "object": "chat.completion.chunk",
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {"tool_calls": promoted},
+                                            "finish_reason": "tool_calls",
+                                        }
+                                    ],
+                                }
+                                mid = client_normalized.get("model")
+                                if isinstance(mid, str) and mid:
+                                    eof_chunk["model"] = mid
+                                out_prom = (
+                                    b"data: "
+                                    + json.dumps(eof_chunk, ensure_ascii=False).encode("utf-8")
+                                    + b"\n\n"
+                                )
+                                if not await write_to_client(out_prom):
+                                    return False
+                                seq_o += 1
+                                logger.info(
+                                    "[eof_promotion] promoted %s tool calls from stripped Factory XML request_id=%s",
+                                    len(promoted),
+                                    rid,
+                                )
+                                d_prom = (eof_chunk["choices"][0].get("delta") or {})
+                                note_tool_ledger(d_prom, "tool_calls")
+                                tool_audit.note_proxy_chat_out(eof_chunk)
+                                pa.proxy_emitted_structured_tool = True
+                                log_proxy_outbound_delta(
+                                    rid,
+                                    "v1/chat_completions",
+                                    route_label,
+                                    sequence=seq_o,
+                                    surface="chat.completion.chunk",
+                                    emitted=canonical_backend_chat_sse(eof_chunk),
+                                    projection=projection_chat_outbound_event(eof_chunk),
                                 )
                             pa.finish_reason = finish_reason
                             await self._finalize_chat_stream_production_audit(
@@ -3192,6 +4045,9 @@ class UnifiedProxy:
                                     try:
                                         choice0 = (obj.get("choices") or [])[0] or {}
                                         delta_obj = choice0.get("delta") or {}
+                                        chunk_id = obj.get("id")
+                                        if isinstance(chunk_id, str) and chunk_id:
+                                            last_stream_chunk_id = chunk_id
                                         fr = choice0.get("finish_reason")
                                         if fr:
                                             finish_reason = fr
@@ -3222,8 +4078,8 @@ class UnifiedProxy:
                                                 choice0.get("finish_reason"),
                                             ),
                                         )
-                                        dc = delta_obj.get("content")
-                                        if isinstance(dc, str) and dc:
+                                        dc = _coerce_chat_delta_content_to_str(delta_obj.get("content"))
+                                        if dc:
                                             tool_audit.note_raw_content(dc)
                                             r_part, v_part = sanitizer.feed_content(dc)
                                             pa.merge_sanitizer_audit(sanitizer.take_audit_events())
@@ -3245,20 +4101,21 @@ class UnifiedProxy:
                                                     phase="reasoning_xml",
                                                 )
                                             new_delta = dict(delta_obj)
-                                            if r_part:
-                                                prev_rc = new_delta.get("reasoning_content")
-                                                new_delta["reasoning_content"] = (
-                                                    (prev_rc + r_part)
-                                                    if isinstance(prev_rc, str)
-                                                    else r_part
-                                                )
-                                                ledger.committed_reasoning_offset += len(r_part)
                                             if v_part is not None:
                                                 new_delta["content"] = v_part
                                                 if v_part:
                                                     ledger.committed_text_offset += len(v_part)
                                             else:
                                                 new_delta["content"] = ""
+                                            new_delta = normalize_outbound_chat_delta(
+                                                new_delta,
+                                                sanitizer_reasoning_delta=r_part
+                                                if r_part
+                                                else None,
+                                            )
+                                            rc_em = new_delta.get("reasoning_content")
+                                            if isinstance(rc_em, str) and rc_em:
+                                                ledger.committed_reasoning_offset += len(rc_em)
                                             keep = bool(
                                                 new_delta.get("tool_calls")
                                                 or new_delta.get("content")
@@ -3285,6 +4142,12 @@ class UnifiedProxy:
                                                     client_write_closed = True
                                                     break
                                                 seq_o += 1
+                                                _rc = new_delta.get("reasoning_content")
+                                                if isinstance(_rc, str) and _rc:
+                                                    tool_audit.note_client_reasoning(len(_rc))
+                                                _vc = new_delta.get("content")
+                                                if isinstance(_vc, str) and _vc:
+                                                    tool_audit.note_client_visible(len(_vc))
                                                 tool_audit.note_proxy_chat_out(obj_out)
                                                 if new_delta.get("tool_calls"):
                                                     pa.proxy_emitted_structured_tool = True
@@ -3298,26 +4161,41 @@ class UnifiedProxy:
                                                     projection=projection_chat_outbound_event(obj_out),
                                                 )
                                         else:
-                                            note_tool_ledger(delta_obj, fr)
-                                            rc = delta_obj.get("reasoning_content")
-                                            rr = delta_obj.get("reasoning")
-                                            if isinstance(rc, str) and rc:
-                                                ledger.committed_reasoning_offset += len(rc)
-                                            elif isinstance(rr, str) and rr:
-                                                ledger.committed_reasoning_offset += len(rr)
-                                            dc2 = delta_obj.get("content")
-                                            if isinstance(dc2, str) and dc2:
-                                                ledger.committed_text_offset += len(dc2)
+                                            new_delta = normalize_outbound_chat_delta(
+                                                dict(delta_obj)
+                                            )
+                                            note_tool_ledger(new_delta, fr)
+                                            rc_n = new_delta.get("reasoning_content")
+                                            if isinstance(rc_n, str) and rc_n:
+                                                ledger.committed_reasoning_offset += len(rc_n)
+                                            dc2_flat = _coerce_chat_delta_content_to_str(new_delta.get("content"))
+                                            if dc2_flat:
+                                                ledger.committed_text_offset += len(dc2_flat)
+                                            obj_out = dict(obj)
+                                            choices_p = list(obj_out.get("choices") or [])
+                                            if choices_p:
+                                                nc = dict(choice0)
+                                                nc["delta"] = new_delta
+                                                choices_p[0] = nc
+                                                obj_out["choices"] = choices_p
                                             out_raw = (
                                                 b"data: "
-                                                + json.dumps(obj, ensure_ascii=False).encode("utf-8")
+                                                + json.dumps(
+                                                    obj_out, ensure_ascii=False
+                                                ).encode("utf-8")
                                                 + b"\n\n"
                                             )
                                             if not await write_to_client(out_raw):
                                                 client_write_closed = True
                                                 break
                                             seq_o += 1
-                                            tool_audit.note_proxy_chat_out(obj)
+                                            _rcp = new_delta.get("reasoning_content")
+                                            if isinstance(_rcp, str) and _rcp:
+                                                tool_audit.note_client_reasoning(len(_rcp))
+                                            _vcp_flat = _coerce_chat_delta_content_to_str(new_delta.get("content"))
+                                            if _vcp_flat:
+                                                tool_audit.note_client_visible(len(_vcp_flat))
+                                            tool_audit.note_proxy_chat_out(obj_out)
                                             if delta_obj.get("tool_calls"):
                                                 pa.proxy_emitted_structured_tool = True
                                             log_proxy_outbound_delta(
@@ -3337,6 +4215,16 @@ class UnifiedProxy:
                                         ):
                                             client_write_closed = True
                                             break
+                                        try:
+                                            _cx = (obj.get("choices") or [{}])[0].get("delta") or {}
+                                            _rxf = _cx.get("reasoning_content")
+                                            if isinstance(_rxf, str) and _rxf:
+                                                tool_audit.note_client_reasoning(len(_rxf))
+                                            _vf = _coerce_chat_delta_content_to_str(_cx.get("content"))
+                                            if _vf:
+                                                tool_audit.note_client_visible(len(_vf))
+                                        except Exception:
+                                            pass
                                 if client_write_closed:
                                     break
                         except StreamIdleTimeoutError as e:
@@ -3460,6 +4348,7 @@ class UnifiedProxy:
                         choices = response_data.get("choices") or []
                         wants_tools_ns = bool(data.get("tools"))
                         rid_ns = get_or_create_request_id(request)
+                        ta_ns = ToolStreamAudit(api="v1/chat_completions")
                         had_tc_ns = False
                         content_like_ns = False
                         reasoning_like_ns = False
@@ -3476,9 +4365,14 @@ class UnifiedProxy:
                                 if isinstance(raw_r, str) and raw_visible_suggests_tool_calls(raw_r):
                                     reasoning_like_ns = True
                                 self._sanitize_assistant_message_inplace(msg)
+                                mrc = msg.get("reasoning_content")
+                                if isinstance(mrc, str) and mrc:
+                                    ta_ns.note_client_reasoning(len(mrc))
+                                mvc = msg.get("content")
+                                if isinstance(mvc, str) and mvc:
+                                    ta_ns.note_client_visible(len(mvc))
                                 tcl = msg.get("tool_calls") or []
                                 had_tc_ns = bool(tcl)
-                        ta_ns = ToolStreamAudit(api="v1/chat_completions")
                         if had_tc_ns:
                             ta_ns.backend_chunks_with_tool_calls = 1
                             ta_ns.proxy_emitted_chat_tool_chunks = 1
@@ -3677,6 +4571,14 @@ class UnifiedProxy:
     
     async def load_model(self, request: Request) -> Response:
         """Load a model"""
+        if not manage_containers_enabled():
+            return web.json_response(
+                {
+                    "success": False,
+                    "error": "Proxy does not manage inference containers (PROXY_MANAGE_CONTAINERS=0). Use vLLM Studio.",
+                },
+                status=403,
+            )
         try:
             model_id = request.match_info["model_id"]
             success = self.model_manager.load_model(model_id)
@@ -3701,6 +4603,14 @@ class UnifiedProxy:
     
     async def unload_model(self, request: Request) -> Response:
         """Unload a model"""
+        if not manage_containers_enabled():
+            return web.json_response(
+                {
+                    "success": False,
+                    "error": "Proxy does not manage inference containers (PROXY_MANAGE_CONTAINERS=0). Use vLLM Studio.",
+                },
+                status=403,
+            )
         try:
             model_id = request.match_info["model_id"]
             success = self.model_manager.unload_model(model_id)
@@ -3787,7 +4697,2957 @@ class UnifiedProxy:
                 {"error": str(e)},
                 status=500
             )
+
+    def _hud_actor(self, request: Request) -> Optional[str]:
+        """Read optional HUD actor identity header."""
+        actor = request.headers.get("X-HUD-Actor")
+        if actor is None:
+            actor = request.headers.get("x-hud-actor")
+        return actor.strip() if actor and actor.strip() else None
+
+    @staticmethod
+    def _hud_normalize_identifier(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _hud_resolve_user_id(
+        self,
+        request: Request,
+        payload: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        if os.environ.get("HUD_RESOLVE_JWT_SUBJECT", "").strip().lower() in {"1", "true", "yes"}:
+            auth = request.headers.get("Authorization") or request.headers.get("authorization")
+            if isinstance(auth, str) and auth.lower().startswith("bearer "):
+                token = auth.split(" ", 1)[1].strip()
+                sub = self._hud_jwt_subject_unverified(token)
+                if sub:
+                    return sub
+        candidates = (
+            request.headers.get("X-HUD-User-Id"),
+            request.headers.get("x-hud-user-id"),
+            request.query.get("user_id"),
+        )
+        if payload is not None:
+            candidates += (
+                payload.get("user_id"),
+                payload.get("userId"),
+                payload.get("actor"),
+            )
+        actor = self._hud_actor(request)
+        if actor is not None:
+            candidates += (actor,)
+        for candidate in candidates:
+            text = self._hud_normalize_identifier(candidate)
+            if text:
+                return text
+        return "localuser"
+
+    @staticmethod
+    def _hud_jwt_subject_unverified(token: str) -> Optional[str]:
+        """Decode JWT payload without signature verification (opt-in via HUD_RESOLVE_JWT_SUBJECT)."""
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        body = parts[1]
+        pad = "=" * ((4 - len(body) % 4) % 4)
+        try:
+            decoded = base64.urlsafe_b64decode(body + pad)
+            payload = json.loads(decoded.decode("utf-8"))
+        except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        sub = payload.get("sub")
+        if isinstance(sub, str) and sub.strip():
+            return sub.strip()
+        return None
+
+    @staticmethod
+    def _hud_projection_mode_client_fields(bundle: Mapping[str, Any]) -> Dict[str, Any]:
+        """Observability fields for MCP HUD responses (v1.2 projection bundle)."""
+        fields: Dict[str, Any] = {
+            "effective_projection_mode": bundle.get("effective_projection_mode"),
+            "projection_mode_requested": bundle.get("projection_mode_requested"),
+            "projection_mode_from_store": bundle.get("projection_mode_from_store"),
+        }
+        pw = bundle.get("persist_warning")
+        if pw:
+            fields["persist_warning"] = pw
+        return {k: v for k, v in fields.items() if v is not None or k == "effective_projection_mode"}
+
+    def _hud_effective_projection_mode(
+        self,
+        request: Request,
+        *,
+        user_id: str,
+        payload: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Resolve projection mode with optional persist (only when persist_mode is true). Returns a bundle dict."""
+        from_store: Optional[str] = None
+        try:
+            from_store = self.hud_store.get_user_projection_mode(user_id)
+        except Exception:
+            logger.exception("Failed to read projection mode for user_id=%s", user_id)
+        persist_warning: Optional[str] = None
+        if payload is not None and "projection_mode" in payload:
+            requested = parse_projection_mode(payload.get("projection_mode"))
+            persist_flag = self._hud_parse_explicit_bool(
+                payload.get("persist_mode") if isinstance(payload, Mapping) else None
+            )
+            persist_flag = bool(persist_flag) if persist_flag is not None else False
+            if persist_flag:
+                try:
+                    self.hud_store.set_user_projection_mode(user_id, requested)
+                except Exception as exc:
+                    logger.warning(
+                        "HUD projection mode persist failed user_id=%s: %s",
+                        user_id,
+                        exc,
+                    )
+                    persist_warning = "projection_preference_persist_failed"
+            return {
+                "effective_projection_mode": requested,
+                "projection_mode_requested": requested,
+                "projection_mode_from_store": from_store,
+                "persist_warning": persist_warning,
+            }
+        effective = from_store if from_store is not None else HUD_DEFAULT_PROJECTION_MODE
+        return {
+            "effective_projection_mode": effective,
+            "projection_mode_requested": None,
+            "projection_mode_from_store": from_store,
+            "persist_warning": None,
+        }
+
+    @staticmethod
+    def _hud_projection_can_dispatch(status: Any, projection_mode: str) -> bool:
+        normalized_status = str(status or "").strip().lower()
+        return projection_mode == HUD_PROJECTION_MODE_LIVE and normalized_status in UnifiedProxy._HUD_PROJECTION_DISPATCH_STATUSES
+
+    @staticmethod
+    def _hud_projection_noop_result(intent: str, *, status: str, projection_mode: str, reason: str) -> Dict[str, Any]:
+        return {
+            "status": "noop",
+            "intent": intent,
+            "adapter": None,
+            "action": "noop",
+            "result": {
+                "status": "ok",
+                "message": reason,
+                "item_status": status,
+                "projection_mode": projection_mode,
+            },
+        }
+
+    @staticmethod
+    def _hud_extract_default_requires_approval(payload: Optional[Mapping[str, Any]]) -> Optional[bool]:
+        if not isinstance(payload, Mapping):
+            return None
+        explicit = payload.get("requires_approval")
+        if "requires_approval" in payload:
+            parsed = UnifiedProxy._hud_parse_explicit_bool(explicit)
+            if parsed is not None:
+                return parsed
+        for key in (
+            "default_requires_approval",
+            "requires_approval_default",
+            "approval_requires",
+            "approval_required",
+            "default_approval",
+            "onboarding_requires_approval",
+        ):
+            parsed = UnifiedProxy._hud_parse_explicit_bool(payload.get(key))
+            if parsed is not None:
+                return parsed
+
+        policy = payload.get("approval_policy")
+        if isinstance(policy, str):
+            normalized_policy = policy.strip().lower()
+            if normalized_policy in {"required", "always", "strict", "approve_review_required"}:
+                return True
+            if normalized_policy in {"optional", "auto", "never", "disabled", "off"}:
+                return False
+        return None
+
+    @staticmethod
+    def _hud_parse_explicit_bool(value: Any) -> Optional[bool]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off"}:
+            return False
+        return None
+
+    @staticmethod
+    def _hud_soul_md_path() -> Path:
+        override = os.environ.get("HUD_SOUL_MD_PATH")
+        if not override:
+            override = os.environ.get("SOUL_MD_PATH")
+        if not override:
+            override = str(REPO_ROOT / "data/obsidian/AdventedHUD/soul.md")
+        return Path(override.strip()).expanduser()
+
+    @staticmethod
+    def _hud_soul_md_worksheet_read_path() -> Path:
+        """Path whose contents are returned by GET /hud/onboarding/soul (interview structure).
+
+        Precedence:
+        1. ``HUD_SOUL_MD_TEMPLATE_PATH`` or ``SOUL_MD_TEMPLATE_PATH`` if set and the file exists
+        2. ``soul.template.md`` next to the canonical soul file, if it exists and is not the same path
+        3. Canonical ``HUD_SOUL_MD_PATH`` (legacy single-file mode)
+
+        Onboarding **gate** and **POST** always use :meth:`_hud_soul_md_path` only.
+        """
+        explicit = os.environ.get("HUD_SOUL_MD_TEMPLATE_PATH") or os.environ.get("SOUL_MD_TEMPLATE_PATH")
+        canonical = UnifiedProxy._hud_soul_md_path().expanduser().resolve()
+        if explicit:
+            candidate = Path(explicit.strip()).expanduser().resolve()
+            if candidate.is_file():
+                return candidate
+            logger.warning(
+                "HUD_SOUL_MD_TEMPLATE_PATH points to a missing file (%s); using worksheet fallback",
+                candidate,
+            )
+        sibling = (canonical.parent / "soul.template.md").expanduser().resolve()
+        if sibling.is_file() and sibling != canonical:
+            return sibling
+        return canonical
+
+    _HUD_SOUL_MD_PLACEHOLDER_TOKENS: Tuple[str, ...] = (
+        "[your answer",
+        "[your mission statement",
+        "example-founder",
+        "example-work",
+        "example-personal",
+        "example-quarterly-objective",
+        "example-monthly-focus",
+        "example-growth-experiment",
+    )
+
+    @staticmethod
+    def _hud_soul_md_part_table_populated(content: str, part_number: int) -> bool:
+        if part_number == 12:
+            heading = "## Roles Matrix"
+        elif part_number == 13:
+            heading = "## Goals Matrix"
+        else:
+            heading = f"## Part {part_number}"
+        part_pattern = re.compile(
+            rf"(?ms)^\s*{re.escape(heading)}\b.*?(?=^\s*##\s|\Z)"
+        )
+        part_match = part_pattern.search(content)
+        if not part_match:
+            return False
+
+        section_text = part_match.group(0)
+        table_rows = [
+            line.strip()
+            for line in section_text.splitlines()
+            if line.strip().startswith("|")
+        ]
+        if not table_rows:
+            return False
+
+        separator_pattern = re.compile(r"^\|\s*:?-{3,}\s*(\|\s*:?-{3,}\s*)+\|?$")
+        separator_index = None
+        for idx, row in enumerate(table_rows):
+            if separator_pattern.match(row):
+                separator_index = idx
+                break
+
+        if separator_index is None:
+            return False
+
+        for row in table_rows[separator_index + 1 :]:
+            if separator_pattern.match(row):
+                continue
+            cells = [cell.strip() for cell in row.strip("|").split("|")]
+            if any(cells) and any(cell.strip() for cell in cells):
+                return True
+        return False
+
+    @staticmethod
+    def _hud_soul_md_gate_issues(content: str) -> List[str]:
+        """Machine-readable reasons soul.md still fails the onboarding gate (may be multiple)."""
+        issues: List[str] = []
+        lower_content = str(content).lower()
+        for token in UnifiedProxy._HUD_SOUL_MD_PLACEHOLDER_TOKENS:
+            if token in lower_content:
+                issues.append(f"placeholder_token:{token}")
+        if not UnifiedProxy._hud_soul_md_part_table_populated(content, 12):
+            issues.append("roles_matrix:no_populated_table_row")
+        if not UnifiedProxy._hud_soul_md_part_table_populated(content, 13):
+            issues.append("goals_matrix:no_populated_table_row")
+        return issues
+
+    @staticmethod
+    def _hud_soul_md_has_placeholder_content(content: str) -> bool:
+        return bool(UnifiedProxy._hud_soul_md_gate_issues(content))
+
+    @staticmethod
+    def _hud_extract_first_role_goal_from_soul(content: str) -> Dict[str, Optional[str]]:
+        """Parse soul.md (after successful write_soul with zero gate issues on Parts 12/13) to extract
+        the first/main role slug + description from Part 12 table and the first/main goal text from
+        Part 13 for that role. This enables atomic population of hud_user_onboarding_states DB table
+        so role_ref/goal_ref are immediately available for downstream classify/ingest/project workers
+        via _hud_apply_user_onboarding_context.
+
+        Returns: {"role_ref": slug or None, "role_description": text or None, "goal_ref": goal text or None}
+        """
+        result: Dict[str, Optional[str]] = {"role_ref": None, "role_description": None, "goal_ref": None}
+        if not content or not isinstance(content, str):
+            return result
+
+        part_pattern = lambda n: re.compile(
+            rf"(?ms)^\s*##\s*Part\s+{n}\b.*?(?=^\s*##\s*Part\s+\d+\b|\Z)"
+        )
+        separator_pattern = re.compile(r"^\|\s*:?-{3,}\s*(\|\s*:?-{3,}\s*)+\|?$")
+
+        # --- Part 12: Roles ---
+        # | Role Slug | Role Name | Brief Description |
+        # First data row provides the "main" role.
+        part12_match = part_pattern(12).search(content)
+        role_slug: Optional[str] = None
+        role_name: Optional[str] = None
+        role_desc: Optional[str] = None
+        if part12_match:
+            section_text = part12_match.group(0)
+            table_rows = [
+                line.strip() for line in section_text.splitlines() if line.strip().startswith("|")
+            ]
+            sep_index = None
+            for idx, row in enumerate(table_rows):
+                if separator_pattern.match(row):
+                    sep_index = idx
+                    break
+            if sep_index is not None:
+                for row in table_rows[sep_index + 1 :]:
+                    if separator_pattern.match(row):
+                        continue
+                    cells = [cell.strip() for cell in row.strip("|").split("|")]
+                    if len(cells) >= 1 and any(c.strip() for c in cells):
+                        role_slug = cells[0] or None
+                        if len(cells) >= 2:
+                            role_name = cells[1] or None
+                        if len(cells) >= 3:
+                            role_desc = cells[2] or None
+                        break  # first non-empty data row is the main/first role
+
+        # --- Part 13: Goals Per Role ---
+        # | Role | Goal | What “done” means... |
+        # Prefer the goal whose Role column matches the Part12 Role Name (case-insensitive);
+        # otherwise fall back to the first goal row.
+        part13_match = part_pattern(13).search(content)
+        goal_ref: Optional[str] = None
+        if part13_match:
+            section_text = part13_match.group(0)
+            table_rows = [
+                line.strip() for line in section_text.splitlines() if line.strip().startswith("|")
+            ]
+            sep_index = None
+            for idx, row in enumerate(table_rows):
+                if separator_pattern.match(row):
+                    sep_index = idx
+                    break
+            if sep_index is not None:
+                for row in table_rows[sep_index + 1 :]:
+                    if separator_pattern.match(row):
+                        continue
+                    cells = [cell.strip() for cell in row.strip("|").split("|")]
+                    if len(cells) >= 2 and any(c.strip() for c in cells):
+                        row_role = cells[0] or ""
+                        row_goal = cells[1] or None
+                        if role_name and row_role.lower() == role_name.lower():
+                            goal_ref = row_goal
+                            break
+                        if goal_ref is None:
+                            goal_ref = row_goal  # fallback to first goal
+        result["role_ref"] = role_slug
+        result["role_description"] = role_desc
+        result["goal_ref"] = goal_ref
+        return result
+
+    @staticmethod
+    def _hud_soul_md_extract_part_section(content: str, part_number: int) -> Optional[str]:
+        """Extract the full text of ## Part N section (until next Part or end)."""
+        part_pattern = re.compile(
+            rf"(?ms)^\s*##\s*Part\s+{part_number}\b.*?(?=^\s*##\s*Part\s+\d+\b|\Z)"
+        )
+        part_match = part_pattern.search(content)
+        if not part_match:
+            return None
+        return part_match.group(0)
+
+    @staticmethod
+    def _hud_soul_md_parse_markdown_table(section_text: str) -> List[List[str]]:
+        """Parse markdown table rows (cells stripped). Skips separators. Used by roles/goals extract and can consolidate with existing."""
+        if not section_text:
+            return []
+        table_rows = [line.strip() for line in section_text.splitlines() if line.strip().startswith("|")]
+        if not table_rows:
+            return []
+        separator_pattern = re.compile(r"^\|\s*:?-{3,}\s*(\|\s*:?-{3,}\s*)+\|?$")
+        rows: List[List[str]] = []
+        for row in table_rows:
+            if separator_pattern.match(row):
+                continue
+            cells = [cell.strip() for cell in row.strip("|").split("|")]
+            if any(c.strip() for c in cells):
+                rows.append(cells)
+        return rows
+
+    @staticmethod
+    def _hud_soul_md_extract_roles_and_goals(content: str) -> Dict[str, Any]:
+        """Dual-mode hud.brief (default no-scope): structured roles from Part 12 + goals_by_role from Part 13.
+        Returns JSON-friendly dict for HUD Agent classification (roles list, goals_by_role, name<->slug map).
+        Extends existing soul table parsing (_hud_extract_first_role_goal_from_soul, _hud_soul_md_part_table_populated).
+        """
+        roles: List[Dict[str, str]] = []
+        goals_by_role: Dict[str, List[Dict[str, str]]] = {}
+        role_name_to_slug: Dict[str, str] = {}
+
+        # Part 12 — Roles table
+        part12 = UnifiedProxy._hud_soul_md_extract_part_section(content, 12)
+        if part12:
+            table = UnifiedProxy._hud_soul_md_parse_markdown_table(part12)
+            for row in table:
+                if len(row) >= 3 and row[0] and not row[0].lower().startswith("role"):
+                    slug = row[0].strip()
+                    name = row[1].strip()
+                    desc = row[2].strip() if len(row) > 2 else ""
+                    if slug and name:
+                        roles.append({"slug": slug, "name": name, "description": desc})
+                        role_name_to_slug[name] = slug
+                        role_name_to_slug[slug] = slug
+
+        # Part 13 — Goals Per Role table
+        part13 = UnifiedProxy._hud_soul_md_extract_part_section(content, 13)
+        if part13:
+            table = UnifiedProxy._hud_soul_md_parse_markdown_table(part13)
+            for row in table:
+                if len(row) >= 2 and row[0] and not row[0].lower().startswith("role"):
+                    role_key = row[0].strip()
+                    goal = row[1].strip()
+                    done = row[2].strip() if len(row) > 2 else ""
+                    if role_key and goal:
+                        if role_key not in goals_by_role:
+                            goals_by_role[role_key] = []
+                        goals_by_role[role_key].append({"goal": goal, "done_definition": done})
+                        if role_key in role_name_to_slug:
+                            sl = role_name_to_slug[role_key]
+                            if sl != role_key and sl not in goals_by_role:
+                                goals_by_role[sl] = goals_by_role[role_key][:]
+
+        return {
+            "roles": roles,
+            "goals_by_role": goals_by_role,
+            "role_name_to_slug": {k: v for k, v in role_name_to_slug.items() if k != v},
+        }
+
+
+    def _hud_onboarding_context_status(self) -> Dict[str, Any]:
+        path = self._hud_soul_md_path()
+        try:
+            content = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            logger.debug("HUD onboarding context not found at %s", path)
+            return {
+                "required": True,
+                "source": "soul_md",
+                "reasons": ["missing_file"],
+                "details": {},
+            }
+        except Exception as exc:
+            logger.debug("HUD onboarding context unavailable at %s: %s", path, exc)
+            return {
+                "required": True,
+                "source": "soul_md",
+                "reasons": ["read_error"],
+                "details": {"error": str(exc)},
+            }
+        if not content or not content.strip():
+            return {
+                "required": True,
+                "source": "soul_md",
+                "reasons": ["empty_file"],
+                "details": {},
+            }
+        if self._hud_soul_md_has_placeholder_content(content):
+            return {
+                "required": True,
+                "source": "soul_md",
+                "reasons": ["placeholder_content"],
+                "details": {"gate_issues": self._hud_soul_md_gate_issues(content)},
+            }
+        return {
+            "required": False,
+            "source": None,
+            "reasons": [],
+            "details": {},
+        }
+
+    def _hud_onboarding_context_complete(self) -> bool:
+        return not self._hud_onboarding_context_status()["required"]
+
+    def _hud_onboarding_gate_response_if_blocked(
+        self,
+        *,
+        route: str,
+        actor: Optional[str],
+    ) -> Optional[web.Response]:
+        """HTTP 409 until soul.md mission context is complete (Part 12/13 populated). hud.brief is now gated (dual-mode: default classification context or scoped items brief)."""
+        ctx = self._hud_onboarding_context_status()
+        if not ctx.get("required"):
+            return None
+        canon = self._hud_soul_md_path().expanduser().resolve()
+        gate_issues: List[str] = []
+        try:
+            if canon.is_file():
+                gate_issues = self._hud_soul_md_gate_issues(
+                    canon.read_text(encoding="utf-8")
+                )
+        except (OSError, UnicodeDecodeError):
+            gate_issues = []
+        full_data: Dict[str, Any] = {
+            "onboarding_needed": True,
+            "onboarding_complete": False,
+            "onboarding_gate_issues": gate_issues,
+            "canonical_path": str(canon),
+            "onboarding_needed_reason": ctx,
+            "next_action": "onboard",
+        }
+        body = hud_error_payload(
+            "Complete personal context onboarding (soul.md) before this HUD operation.",
+            "onboarding_required",
+            "must_complete_onboarding",
+            route=route,
+            actor=actor,
+            data=self._hud_maybe_redact_onboarding_error_data(full_data),
+        )
+        return web.json_response(
+            body,
+            status=HUD_ERROR_HTTP_STATUS["onboarding_required"],
+        )
+
+    @staticmethod
+    def _hud_agent_safe_onboarding_errors() -> bool:
+        return os.environ.get("HUD_AGENT_SAFE_ONBOARDING_ERRORS", "").strip().lower() in {"1", "true", "yes"}
+
+    @staticmethod
+    def _hud_require_post_onboarding_push_policy() -> bool:
+        raw = (os.environ.get("HUD_REQUIRE_POST_ONBOARDING_PUSH") or "1").strip().lower()
+        if raw in {"0", "false", "no", "off"}:
+            return False
+        return True
+
+    def _hud_push_policy_client_fields(self, user_id: str) -> Dict[str, Any]:
+        """When soul gate is satisfied, signal whether MCP hud.set_push_policy is still required."""
+        if not self._hud_require_post_onboarding_push_policy():
+            return {}
+        if not self._hud_onboarding_context_complete():
+            return {}
+        try:
+            policy = self.hud_store.get_user_push_policy(user_id)
+        except Exception:
+            logger.exception("HUD get_user_push_policy failed user_id=%s", user_id)
+            policy = None
+        if policy is not None:
+            return {"post_onboarding_push_policy_required": False}
+        return {"post_onboarding_push_policy_required": True, "next_action": "choose_push_policy"}
+
+    @staticmethod
+    def _hud_maybe_redact_onboarding_error_data(data: Mapping[str, Any]) -> Dict[str, Any]:
+        if not UnifiedProxy._hud_agent_safe_onboarding_errors():
+            return dict(data)
+        return {
+            "onboarding_needed": bool(data.get("onboarding_needed", True)),
+            "onboarding_complete": bool(data.get("onboarding_complete", False)),
+            "next_action": str(data.get("next_action") or "onboard"),
+        }
+
+    @staticmethod
+    def _hud_maybe_redact_push_policy_error_data(data: Mapping[str, Any]) -> Dict[str, Any]:
+        if not UnifiedProxy._hud_agent_safe_onboarding_errors():
+            return dict(data)
+        return {
+            "post_onboarding_push_required": bool(data.get("post_onboarding_push_required", True)),
+            "next_action": "choose_push_policy",
+        }
+
+    def _hud_push_policy_gate_response_if_blocked(
+        self,
+        *,
+        route: str,
+        actor: Optional[str],
+        user_id: str,
+    ) -> Optional[web.Response]:
+        if not self._hud_require_post_onboarding_push_policy():
+            return None
+        if not self._hud_onboarding_context_complete():
+            return None
+        try:
+            policy = self.hud_store.get_user_push_policy(user_id)
+        except Exception:
+            logger.exception("HUD get_user_push_policy failed user_id=%s", user_id)
+            policy = None
+        if policy is not None:
+            return None
+        full_data: Dict[str, Any] = {
+            "post_onboarding_push_required": True,
+            "next_action": "choose_push_policy",
+            "onboarding_needed": False,
+            "onboarding_complete": True,
+        }
+        msg = (
+            "Mission profile is ready; confirm whether HUD may push to external calendar and tasks "
+            "without per-item approval."
+        )
+        body = hud_error_payload(
+            msg,
+            "policy_required",
+            "must_complete_push_policy",
+            route=route,
+            actor=actor,
+            data=self._hud_maybe_redact_push_policy_error_data(full_data),
+        )
+        return web.json_response(body, status=HUD_ERROR_HTTP_STATUS["push_policy_required"])
+
+    _HUD_SOUL_MD_WRITE_MAX_BYTES = 524288
+
+    @staticmethod
+    def _hud_coerce_soul_md_write_markdown(payload: Mapping[str, Any]) -> str:
+        for key in ("markdown", "content", "body", "text"):
+            val = payload.get(key)
+            if isinstance(val, str) and val.strip():
+                return val
+        raise ValueError(
+            "soul.md write requires a non-empty string in one of: markdown, content, body, text"
+        )
+
+    def _hud_write_soul_md_atomic(self, markdown: str) -> Path:
+        raw = markdown.encode("utf-8")
+        if len(raw) > self._HUD_SOUL_MD_WRITE_MAX_BYTES:
+            raise ValueError(
+                f"soul.md body exceeds maximum size ({self._HUD_SOUL_MD_WRITE_MAX_BYTES} bytes)"
+            )
+        path = self._hud_soul_md_path().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+        tmp.write_bytes(raw)
+        try:
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                tmp.unlink(missing_ok=True)
+            except TypeError:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            raise
+        return path
+
+    def _hud_onboarding_soul_build_response(
+        self,
+        *,
+        actor: Optional[str],
+        payload: Mapping[str, Any],
+        route: str,
+        route_meta: Optional[Dict[str, Any]] = None,
+        request: Optional[Request] = None,
+    ) -> web.Response:
+        try:
+            markdown = self._hud_coerce_soul_md_write_markdown(payload)
+            written_path = self._hud_write_soul_md_atomic(markdown)
+        except ValueError as exc:
+            return web.json_response(
+                hud_error_payload(
+                    str(exc),
+                    "validation_error",
+                    "invalid_payload",
+                    route=route,
+                    actor=actor,
+                ),
+                status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+            )
+        except OSError as exc:
+            return web.json_response(
+                hud_error_payload(
+                    f"Failed to write soul.md: {exc}",
+                    "internal_error",
+                    "internal_error",
+                    route=route,
+                    actor=actor,
+                ),
+                status=500,
+            )
+        ctx = self._hud_onboarding_context_status()
+        meta = route_meta or self._hud_route_meta(HUD_INTENT_ONBOARDING_WRITE_SOUL)
+        try:
+            written_body = written_path.read_text(encoding="utf-8")
+        except OSError:
+            written_body = ""
+        gate_issues = self._hud_soul_md_gate_issues(written_body)
+
+        # Phase 2: After successful atomic write_soul (file written cleanly, zero gate issues for
+        # placeholders + Part 12/13 populated tables), parse the soul.md for the first/main role
+        # (slug + description) from Part 12 and first goal from Part 13, then call set_user_onboarding_state
+        # so the DB table hud_user_onboarding_states is populated atomically with the file state.
+        # This ensures role_ref/goal_ref are available immediately for _hud_apply_user_onboarding_context
+        # (used by classify, project, ingest, Google Tasks adapter, etc.) without waiting for a later classify.
+        # Only on clean success (no gate issues); partial writes leave DB untouched.
+        if not gate_issues:
+            try:
+                extracted = self._hud_extract_first_role_goal_from_soul(written_body)
+                if request is not None:
+                    uid = self._hud_resolve_user_id(request, payload=payload)
+                    if uid and extracted.get("role_ref"):
+                        self.hud_store.set_user_onboarding_state(
+                            uid,
+                            role_ref=extracted.get("role_ref"),
+                            goal_ref=extracted.get("goal_ref"),
+                            requires_approval=None,  # do not overwrite push/approval policy here; set later via set_push_policy
+                        )
+                        logger.info(
+                            "HUD Phase2: populated hud_user_onboarding_states after clean soul write: "
+                            "user_id=%s role_ref=%s goal_ref=%s",
+                            uid,
+                            extracted.get("role_ref"),
+                            extracted.get("goal_ref"),
+                        )
+            except Exception as exc:  # defensive; do not fail the write response
+                logger.warning(
+                    "HUD Phase2: non-fatal failure populating onboarding state DB after soul write: %s",
+                    exc,
+                )
+
+        onboarding_required = bool(ctx.get("required"))
+        data: Dict[str, Any] = {
+            "path": str(written_path),
+            "onboarding_needed": onboarding_required,
+            "onboarding_complete": not onboarding_required,
+            "onboarding_gate_issues": gate_issues,
+            "onboarding_needed_reason": ctx,
+        }
+        if request is not None and not onboarding_required:
+            uid = self._hud_resolve_user_id(request, payload=payload)
+            data.update(self._hud_push_policy_client_fields(uid))
+        return web.json_response(
+            hud_success_payload(
+                route,
+                status="ok",
+                actor=actor,
+                route_meta=meta,
+                data=data,
+            ),
+            status=200,
+        )
+
+    def _hud_onboarding_soul_read_response(
+        self,
+        *,
+        actor: Optional[str],
+        route: str,
+        route_meta: Optional[Dict[str, Any]] = None,
+        request: Optional[Request] = None,
+    ) -> web.Response:
+        worksheet_path = self._hud_soul_md_worksheet_read_path()
+        canonical_path = self._hud_soul_md_path().expanduser().resolve()
+        try:
+            raw = worksheet_path.read_bytes()
+            exists = True
+        except FileNotFoundError:
+            raw = b""
+            exists = False
+        except OSError as exc:
+            return web.json_response(
+                hud_error_payload(
+                    f"Failed to read soul.md: {exc}",
+                    "internal_error",
+                    "internal_error",
+                    route=route,
+                    actor=actor,
+                ),
+                status=500,
+            )
+        if len(raw) > self._HUD_SOUL_MD_WRITE_MAX_BYTES:
+            return web.json_response(
+                hud_error_payload(
+                    f"soul.md exceeds maximum size ({self._HUD_SOUL_MD_WRITE_MAX_BYTES} bytes)",
+                    "validation_error",
+                    "invalid_payload",
+                    route=route,
+                    actor=actor,
+                ),
+                status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+            )
+        try:
+            markdown = raw.decode("utf-8") if raw else ""
+        except UnicodeDecodeError:
+            return web.json_response(
+                hud_error_payload(
+                    "soul.md is not valid UTF-8",
+                    "validation_error",
+                    "invalid_payload",
+                    route=route,
+                    actor=actor,
+                ),
+                status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+            )
+        ctx = self._hud_onboarding_context_status()
+        meta = route_meta or self._hud_route_meta(HUD_INTENT_ONBOARDING_READ_SOUL)
+        read_source = "worksheet" if worksheet_path != canonical_path else "canonical"
+        canon_gate_issues: List[str] = []
+        try:
+            if canonical_path.is_file():
+                canon_gate_issues = self._hud_soul_md_gate_issues(
+                    canonical_path.read_text(encoding="utf-8")
+                )
+        except (OSError, UnicodeDecodeError):
+            canon_gate_issues = []
+        onboarding_required = bool(ctx.get("required"))
+        data: Dict[str, Any] = {
+            "path": str(worksheet_path),
+            "canonical_path": str(canonical_path),
+            "read_source": read_source,
+            "exists": exists,
+            "byte_length": len(raw),
+            "markdown": markdown,
+            "onboarding_needed": onboarding_required,
+            "onboarding_complete": not onboarding_required,
+            "onboarding_gate_issues": canon_gate_issues,
+            "onboarding_needed_reason": ctx,
+        }
+        if request is not None and not onboarding_required:
+            uid = self._hud_resolve_user_id(request)
+            data.update(self._hud_push_policy_client_fields(uid))
+        return web.json_response(
+            hud_success_payload(
+                route,
+                status="ok",
+                actor=actor,
+                route_meta=meta,
+                data=data,
+            ),
+            status=200,
+        )
+
+    async def hud_onboarding_soul_read(self, request: Request) -> Response:
+        """Read onboarding worksheet markdown (admin); bypasses onboarding gate for interview prep."""
+        actor = self._hud_actor(request)
+        # Auth removed - delegated to agent-service
+        return self._hud_onboarding_soul_read_response(
+            actor=actor,
+            route=HUD_ROUTE_ONBOARDING_SOUL,
+            request=request,
+        )
+
+    def _hud_apply_user_onboarding_context(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        user_id: str,
+    ) -> Dict[str, Any]:
+        enriched = dict(payload)
+        onboarding_status = self._hud_onboarding_context_status()
+        onboarding_needed = onboarding_status["required"]
+        try:
+            context = self.hud_store.get_user_onboarding_state(user_id) if user_id else None
+        except Exception:
+            logger.exception("Failed to load onboarding context for user_id=%s", user_id)
+            context = None
+
+        enriched["onboarding_needed"] = onboarding_needed
+        enriched["onboarding_needed_reason"] = onboarding_status
+        if not context or onboarding_needed:
+            return enriched
+ 
+        role_present = self._hud_normalize_identifier(
+            payload.get("role_ref")
+            or payload.get("role")
+            or payload.get("roleId")
+            or payload.get("role_id")
+        )
+        goal_present = self._hud_normalize_identifier(
+            payload.get("goal_ref")
+            or payload.get("goalId")
+            or payload.get("goal_id")
+        )
+
+        if not role_present and context.get("role_ref"):
+            enriched["role_ref"] = context.get("role_ref")
+        if not goal_present and context.get("goal_ref"):
+            enriched["goal_ref"] = context.get("goal_ref")
+        if "requires_approval" not in payload and context.get("requires_approval") is not None:
+            enriched["requires_approval"] = context.get("requires_approval")
+        return enriched
+
+    def _hud_store_user_onboarding_state(
+        self,
+        user_id: str,
+        *,
+        payload: Mapping[str, Any],
+        classification: Mapping[str, Any],
+    ) -> None:
+        if not user_id:
+            return
+
+        role_ref = classification.get("role_ref")
+        goal_ref = classification.get("goal_ref")
+        requires_approval = self._hud_extract_default_requires_approval(payload)
+
+        if role_ref is None and goal_ref is None and requires_approval is None:
+            return
+
+        self.hud_store.set_user_onboarding_state(
+            user_id,
+            role_ref=role_ref if self._hud_normalize_identifier(role_ref) else None,
+            goal_ref=goal_ref if self._hud_normalize_identifier(goal_ref) else None,
+            requires_approval=requires_approval,
+        )
+
+    def _hud_next_status_for_intent(self, intent: str, *, current_status: Optional[str] = None) -> Optional[str]:
+        """Compute canonical next status using the worker transition matrix."""
+        classification = self.hud_workers.classify({"intent": intent, "status": current_status or ""})
+        transition = classification.get("status_transition", {})
+        if isinstance(transition, Mapping):
+            target = transition.get("to")
+            if isinstance(target, str) and target.strip():
+                return target
+        return None
+
+    @staticmethod
+    def _hud_storage_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
+        sanitized = dict(payload)
+        sanitized.pop("oauth_credentials", None)
+        sanitized.pop("token_credentials", None)
+        sanitized.pop("onboarding_needed_reason", None)
+        return sanitized
+
+    @staticmethod
+    def _hud_extract_source_id(payload: Mapping[str, Any]) -> Optional[str]:
+        for key in (
+            "source_id",
+            "source_ref",
+            "goal_id",
+            "role_id",
+            "event_id",
+            "task_id",
+            "external_id",
+            "google_id",
+        ):
+            value = payload.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+        return None
+
+    def _hud_admin_key(self) -> Optional[str]:
+        """Return configured HUD admin key if enabled."""
+        admin_key = os.environ.get("HUD_ADMIN_API_KEY", "").strip()
+        return admin_key or None
+
+    async def _require_hud_admin(self, request: Request) -> Optional[Response]:
+        """Enforce HUD admin key."""
+        actor = self._hud_actor(request)
+        required_key = self._hud_admin_key()
+        if not required_key:
+            return web.json_response(
+                hud_error_payload(
+                    "HUD admin key is not configured",
+                    "authentication_error",
+                    "missing_hud_admin_key",
+                    service="HUD",
+                    route=str(request.path),
+                    actor=actor,
+                ),
+                status=401,
+            )
+
+        provided_key = request.headers.get("X-HUD-Admin-Key")
+        if provided_key is None:
+            provided_key = request.headers.get("x-hud-admin-key")
+        if provided_key is None:
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                provided_key = auth_header[7:]
+
+
+        if provided_key == required_key:
+            return None
+
+        return web.json_response(
+            hud_error_payload(
+                "Invalid or missing HUD admin key",
+                "authentication_error",
+                "invalid_hud_admin_key",
+                route=str(request.path),
+                actor=actor,
+            ),
+            status=401,
+        )
+
+    def _hud_store_error_response(
+        self,
+        *,
+        route: str,
+        actor: Optional[str],
+        exc: Exception,
+    ) -> Response:
+        logger.error("HUD store failure for route=%s error=%s", route, exc, exc_info=True)
+        return web.json_response(
+            hud_error_payload(
+                "HUD store operation failed",
+                "internal_error",
+                "internal_error",
+                route=route,
+                actor=actor,
+            ),
+            status=500,
+        )
+
+    def _hud_not_found_error_response(
+        self,
+        *,
+        route: str,
+        actor: Optional[str],
+        item_id: str,
+    ) -> Response:
+        return web.json_response(
+            hud_error_payload(
+                f"HUD item '{item_id}' not found",
+                "item_not_found",
+                "item_not_found",
+                route=route,
+                actor=actor,
+            ),
+            status=404,
+        )
+
+    @staticmethod
+    def _hud_item_sort_key(item: Dict[str, Any]) -> tuple:
+        try:
+            queue_rank = int(item.get("queue_rank") or 0)
+        except (TypeError, ValueError):
+            queue_rank = 0
+        created_at = item.get("created_at")
+        internal_id = item.get("internal_id")
+        return (
+            queue_rank,
+            str(created_at) if created_at is not None else "",
+            str(internal_id) if internal_id is not None else "",
+        )
+
+    @staticmethod
+    def _hud_deterministic_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return sorted(items, key=UnifiedProxy._hud_item_sort_key)
+
+    @staticmethod
+    def _hud_status_data(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        sync_payload = build_sync_status_payload(items)
+        brief_report = build_brief_sync_report(items)
+
+        data: Dict[str, Any] = {
+            "summary": sync_payload["summary"],
+            "items": items,
+        }
+        if brief_report["stale"]:
+            data["stale"] = brief_report["stale"]
+        if brief_report["failed"]:
+            data["failed"] = brief_report["failed"]
+        if brief_report["pending_approval"]:
+            data["pending_approval"] = brief_report["pending_approval"]
+        return data
+
+    @staticmethod
+    def _hud_sync_issue_data(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        brief_report = build_brief_sync_report(items)
+        data: Dict[str, Any] = {}
+        if brief_report["stale"]:
+            data["stale"] = brief_report["stale"]
+        if brief_report["failed"]:
+            data["failed"] = brief_report["failed"]
+        if brief_report["pending_approval"]:
+            data["pending_approval"] = brief_report["pending_approval"]
+        return data
+
+    def _hud_operation_for_intent(self, intent: str) -> str:
+        try:
+            return self.hud_workers.classify({"intent": intent}).get("action", "noop")
+        except Exception:
+            return "noop"
+
+    def _hud_route_meta(self, intent: str, *, method: Optional[str] = None, jsonrpc: Optional[str] = None) -> Dict[str, Any]:
+        route_meta: Dict[str, Any] = {
+            "intent": intent,
+            "mapped_intent": intent,
+            "operation": self._hud_operation_for_intent(intent),
+        }
+        if method is not None:
+            route_meta["method"] = method
+        if jsonrpc is not None:
+            route_meta["jsonrpc"] = jsonrpc
+        return route_meta
+
+    @staticmethod
+    def _hud_is_terminal_status(status: Any) -> bool:
+        normalized = str(status or "").strip().lower()
+        return normalized in UnifiedProxy._HUD_TERMINAL_STATUSES
+
+    async def _hud_dispatch_projection(self, intent: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+        # Phase 1: Always write to Obsidian (source of truth per foundation spec §7)
+        try:
+            primary = await self.hud_adapter_hub.dispatch(intent, payload)
+        except Exception as exc:
+            logger.warning(
+                "HUD primary (obsidian) dispatch failed intent=%s payload_keys=%s error=%s",
+                intent,
+                sorted(list(payload.keys())),
+                exc,
+                exc_info=True,
+            )
+            primary = {
+                "status": "error",
+                "intent": str(intent),
+                "adapter": None,
+                "action": None,
+                "error": {"code": "dispatch_exception", "message": str(exc)},
+                "result": {"status": "error", "message": str(exc)},
+            }
+
+        # Phase 2: Also dispatch to targeted adapter (gcal/gtasks) if applicable
+        adapter_target = payload.get("adapter_target")
+        if isinstance(adapter_target, str) and adapter_target.strip() and adapter_target.strip() not in ("obsidian", ""):
+            secondary_intent = f"{adapter_target.strip()}.upsert"
+            try:
+                secondary = await self.hud_adapter_hub.dispatch(secondary_intent, payload)
+                return secondary
+            except Exception as exc:
+                logger.warning(
+                    "HUD secondary dispatch failed intent=%s error=%s",
+                    secondary_intent,
+                    exc,
+                    exc_info=True,
+                )
+                return {
+                    "status": "error",
+                    "intent": secondary_intent,
+                    "adapter": adapter_target.strip(),
+                    "action": "upsert_item",
+                    "error": {"code": "secondary_dispatch_exception", "message": str(exc)},
+                    "result": {"status": "error", "message": str(exc)},
+                }
+
+        return primary
+
+    @staticmethod
+    def _hud_adapter_projection_failed(adapter_projection: Dict[str, Any]) -> bool:
+        if str(adapter_projection.get("status", "")).strip().lower() in {"error", "blocked"}:
+            return True
+        result = adapter_projection.get("result")
+        return isinstance(result, dict) and str(result.get("status", "")).strip().lower() in {"error", "blocked"}
+
+    @staticmethod
+    def _hud_adapter_projection_error_message(adapter_projection: Dict[str, Any], *, fallback_intent: Optional[str] = None) -> str:
+        error = adapter_projection.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+        result = adapter_projection.get("result")
+        if isinstance(result, dict):
+            message = result.get("message")
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+            nested_error = result.get("error")
+            if isinstance(nested_error, str) and nested_error.strip():
+                return nested_error.strip()
+        status = adapter_projection.get("status", "error")
+        intent = fallback_intent or adapter_projection.get("intent") or "unknown"
+        return f"Adapter projection failed for intent '{intent}' with status '{status}'"
+
+    async def _hud_adapter_sync_previews(self) -> Dict[str, Any]:
+        previews: Dict[str, Any] = {}
+        previews["roles"] = await self._hud_dispatch_projection("sync", {"kind": "roles"})
+        previews["calendar"] = await self._hud_dispatch_projection("calendar.sync", {"kind": "events"})
+        previews["tasks"] = await self._hud_dispatch_projection("gtasks.sync", {"kind": "tasks"})
+        return previews
+
+    @staticmethod
+    def _hud_projection_payload_for_item(
+        item: Dict[str, Any],
+        actor: Optional[str],
+        status: str,
+        *,
+        projection_mode: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        base_payload = item.get("payload_json")
+        if not isinstance(base_payload, dict):
+            base_payload = {}
+        projection_payload = dict(base_payload)
+        resolved_projection_mode = normalize_projection_mode(projection_mode)
+        if resolved_projection_mode is None:
+            resolved_projection_mode = HUD_DEFAULT_PROJECTION_MODE
+        projection_payload["projection_mode"] = resolved_projection_mode
+
+        if "intent" not in projection_payload:
+            projection_payload["intent"] = item.get("intent") or HUD_INTENT_INGEST
+        if "scope" not in projection_payload or not projection_payload.get("scope"):
+            projection_payload["scope"] = item.get("scope")
+        if "status" not in projection_payload or not projection_payload.get("status"):
+            projection_payload["status"] = status
+        if "item_id" not in projection_payload or not projection_payload.get("item_id"):
+            projection_payload["item_id"] = item.get("internal_id")
+        if actor is not None and not projection_payload.get("actor"):
+            projection_payload["actor"] = actor
+
+        for key in (
+            "classification",
+            "projection",
+            "goal_ref",
+            "role_ref",
+            "semantic_type",
+            "google_target",
+            "adapter_target",
+            "adapter_method",
+            "requires_approval",
+            "source_id",
+            "last_synced_at",
+        ):
+            if key in item and key not in projection_payload:
+                projection_payload[key] = item.get(key)
+
+        # Promote adapter_target and adapter_method from projection metadata
+        # (Hub's _resolve reads these from the payload root, not from projection.*)
+        for _key in ("adapter_target", "adapter_method"):
+            if _key not in projection_payload:
+                _proj = projection_payload.get("projection", {})
+                if isinstance(_proj, dict) and _key in _proj:
+                    projection_payload[_key] = _proj[_key]
+
+        return {
+            "intent": item.get("intent")
+            or item.get("payload_json", {}).get("intent", HUD_INTENT_INGEST),
+            "scope": item.get("scope"),
+            "actor": actor,
+            "status": status,
+            "projection_mode": resolved_projection_mode,
+            "payload": projection_payload,
+            "item_id": item.get("internal_id"),
+        }
+
+    def _hud_worker_input_payload(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        intent: str,
+        status: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        normalized = dict(payload)
+        normalized.pop("onboarding_needed_reason", None)
+        normalized.setdefault("intent", intent)
+        if status is not None and not normalized.get("status"):
+            normalized["status"] = status
+        return normalized
+
+    def _hud_classify_project_pair(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        intent: str,
+        status: Optional[str] = None,
+        projection_mode: Optional[str] = None,
+    ):
+        worker_payload = self._hud_worker_input_payload(payload, intent=intent, status=status)
+        normalized_mode = normalize_projection_mode(projection_mode)
+        if normalized_mode is not None:
+            worker_payload["projection_mode"] = normalized_mode
+        classification = self.hud_workers.classify(worker_payload)
+        projection = self.hud_workers.project(worker_payload)
+        if "onboarding_needed" in worker_payload:
+            onboarding_needed = self._hud_parse_explicit_bool(worker_payload.get("onboarding_needed"))
+            if onboarding_needed is not None:
+                classification = dict(classification)
+                projection = dict(projection)
+                classification["onboarding_needed"] = onboarding_needed
+                projection["onboarding_needed"] = onboarding_needed
+        return classification, projection
+
+    @staticmethod
+    def _hud_payload_with_hud_metadata(
+        payload: Mapping[str, Any],
+        *,
+        classification: Mapping[str, Any],
+        projection: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        enriched = dict(payload)
+        enriched["classification"] = dict(classification)
+        enriched["projection"] = dict(projection)
+        return enriched
+
+    async def hud_ingest(self, request: Request) -> Response:
+        actor = self._hud_actor(request)
+        # Auth delegated to agent-service via catch-all _hud_forward passthrough
+
+        try:
+            payload = require_json(await request.text())
+        except ValueError as exc:
+            return web.json_response(
+                hud_error_payload(
+                    str(exc),
+                    "validation_error",
+                    "invalid_payload",
+                    route="/hud/ingest",
+                    actor=actor,
+                ),
+                status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+            )
+
+        try:
+            scope = parse_hud_scope(payload.get("scope"))
+        except ValueError as exc:
+            return web.json_response(
+                hud_error_payload(
+                    str(exc),
+                    "validation_error",
+                    "invalid_payload",
+                    route="/hud/ingest",
+                    actor=actor,
+                ),
+                status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+            )
+
+        import uuid
+
+        internal_id = payload.get("item_id", payload.get("internal_id"))
+        if internal_id is not None:
+            try:
+                internal_id = validate_hud_id(internal_id)
+            except ValueError as exc:
+                return web.json_response(
+                    hud_error_payload(
+                        str(exc),
+                        "validation_error",
+                        "invalid_payload",
+                        route="/hud/ingest",
+                        actor=actor,
+                    ),
+                    status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+                )
+        else:
+            internal_id = uuid.uuid4().hex
+
+        blocked = self._hud_onboarding_gate_response_if_blocked(route=HUD_ROUTE_INGEST, actor=actor)
+        if blocked is not None:
+            return blocked
+
+        user_id = self._hud_resolve_user_id(request, payload=payload)
+        push_blocked = self._hud_push_policy_gate_response_if_blocked(
+            route=HUD_ROUTE_INGEST, actor=actor, user_id=user_id
+        )
+        if push_blocked is not None:
+            return push_blocked
+        try:
+            projection_bundle = self._hud_effective_projection_mode(
+                request,
+                user_id=user_id,
+                payload=payload,
+            )
+        except ValueError as exc:
+            return web.json_response(
+                hud_error_payload(
+                    str(exc),
+                    "validation_error",
+                    "invalid_payload",
+                    route="/hud/ingest",
+                    actor=actor,
+                ),
+                status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+            )
+        except sqlite3.DatabaseError as exc:
+            return self._hud_store_error_response(route="/hud/ingest", actor=actor, exc=exc)
+        except Exception as exc:
+            return self._hud_store_error_response(route="/hud/ingest", actor=actor, exc=exc)
+
+        projection_mode = projection_bundle["effective_projection_mode"]
+
+        idempotency_key = payload.get("idempotency", payload.get("idempotency_key"))
+        if idempotency_key is not None and not isinstance(idempotency_key, str):
+            idempotency_key = str(idempotency_key)
+
+        payload = self._hud_apply_user_onboarding_context(payload, user_id=user_id)
+        ingest_intent = payload.get("intent", HUD_INTENT_INGEST)
+        onboarding_needed = bool(payload.get("onboarding_needed"))
+        onboarding_needed_reason = payload.get("onboarding_needed_reason")
+        classification, projection = self._hud_classify_project_pair(
+            payload,
+            intent=ingest_intent,
+            status="queued",
+            projection_mode=projection_mode,
+        )
+        initial_status = "pending_approval" if projection.get("requires_approval") else "queued"
+        if initial_status == "pending_approval":
+            classification, projection = self._hud_classify_project_pair(
+                payload,
+                intent=ingest_intent,
+                status=initial_status,
+                projection_mode=projection_mode,
+            )
+            onboarding_needed = bool(payload.get("onboarding_needed"))
+
+        storage_payload = self._hud_storage_payload(payload)
+        storage_payload = self._hud_payload_with_hud_metadata(
+            storage_payload,
+            classification=classification,
+            projection=projection,
+        )
+
+        try:
+            item = self.hud_store.upsert_item(
+                {
+                    "internal_id": internal_id,
+                    "google_id": payload.get("google_id"),
+                    "external_id": payload.get("external_id"),
+                    "actor": actor,
+                    "intent": ingest_intent,
+                    "scope": scope,
+                    "payload_json": storage_payload,
+                    "status": initial_status,
+                    "priority_class": classification.get("priority_class"),
+                    "google_target": classification.get("google_target"),
+                    "semantic_type": classification.get("semantic_type"),
+                    "role_ref": classification.get("role_ref"),
+                    "goal_ref": classification.get("goal_ref"),
+                    "idempotency_key": idempotency_key,
+                    "source_id": self._hud_extract_source_id(payload),
+                    "last_synced_at": payload.get("last_synced_at"),
+                }
+            )
+        except sqlite3.DatabaseError as exc:
+            return self._hud_store_error_response(
+                route="/hud/ingest",
+                actor=actor,
+                exc=exc,
+            )
+        except Exception as exc:
+            return self._hud_store_error_response(
+                route="/hud/ingest",
+                actor=actor,
+                exc=exc,
+            )
+
+        try:
+            self._hud_store_user_onboarding_state(
+                user_id,
+                payload=payload,
+                classification=classification,
+            )
+        except Exception:
+            logger.exception("Failed to persist onboarding state for user_id=%s", user_id)
+
+        if self._hud_projection_can_dispatch(item.get("status"), projection_mode):
+            adapter_projection = await self._hud_dispatch_projection(
+                item.get("intent") or ingest_intent,
+                self._hud_projection_payload_for_item(
+                    item,
+                    actor=actor,
+                    status=initial_status,
+                    projection_mode=projection_mode,
+                ),
+            )
+        else:
+            reason = "projection deferred until approval"
+            if projection_mode != HUD_PROJECTION_MODE_LIVE:
+                reason = "projection_mode is preview-only"
+            elif self._hud_normalize_identifier(item.get("status")) == "pending_approval":
+                reason = "projection deferred until approval"
+            adapter_projection = self._hud_projection_noop_result(
+                item.get("intent") or ingest_intent,
+                status=item.get("status") or initial_status,
+                projection_mode=projection_mode,
+                reason=reason,
+            )
+        return web.json_response(
+            hud_success_payload(
+                "/hud/ingest",
+                status="ok",
+                actor=actor,
+                route_meta={"intent": HUD_INTENT_INGEST},
+                data={
+                    "item": item,
+                    "adapter_projection": adapter_projection,
+                    "onboarding_needed": onboarding_needed,
+                    "onboarding_needed_reason": onboarding_needed_reason,
+                    "classification": classification,
+                    "projection": projection,
+                    **self._hud_projection_mode_client_fields(projection_bundle),
+                },
+            ),
+            status=200,
+        )
+
+    async def hud_onboarding_soul(self, request: Request) -> Response:
+        """Write canonical soul.md (admin); bypasses onboarding gate so onboarding can complete."""
+        actor = self._hud_actor(request)
+        # Auth removed - delegated to agent-service
+        try:
+            payload = require_json(await request.text())
+        except ValueError as exc:
+            return web.json_response(
+                hud_error_payload(
+                    str(exc),
+                    "validation_error",
+                    "invalid_payload",
+                    route=HUD_ROUTE_ONBOARDING_SOUL,
+                    actor=actor,
+                ),
+                status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+            )
+        return self._hud_onboarding_soul_build_response(
+            actor=actor,
+            payload=payload,
+            route=HUD_ROUTE_ONBOARDING_SOUL,
+            request=request,
+        )
+
+    async def hud_brief(self, request: Request) -> Response:
+        actor = self._hud_actor(request)
+        # Auth delegated to agent-service via catch-all _hud_forward passthrough
+
+        body = await request.text()
+        scope_source = request.query.get("scope")
+        payload: Dict[str, Any] = {}
+
+        if body.strip():
+            try:
+                payload = require_json(body)
+                scope_source = payload.get("scope", scope_source)
+            except ValueError as exc:
+                return web.json_response(
+                    hud_error_payload(
+                        str(exc),
+                        "validation_error",
+                        "invalid_payload",
+                        route="/hud/brief",
+                        actor=actor,
+                    ),
+                    status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+                )
+
+        # Dual-mode detection: absence of scope param (or empty) -> default classification_context
+        # (for HUD Agent internal use of roles/goals/decision matrix). Explicit scope -> scoped items brief.
+        explicit_scope = scope_source is not None and str(scope_source).strip() != ""
+        if explicit_scope:
+            try:
+                scope = parse_hud_scope(scope_source)
+            except ValueError as exc:
+                return web.json_response(
+                    hud_error_payload(
+                        str(exc),
+                        "validation_error",
+                        "invalid_payload",
+                        route="/hud/brief",
+                        actor=actor,
+                    ),
+                    status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+                )
+        else:
+            scope = None
+
+        user_id = self._hud_resolve_user_id(request, payload=payload)
+
+        # Hard gate: hud.brief removed from UNGATED and EXEMPT; must complete full ritual (soul Parts 12/13 + push_policy)
+        blocked = self._hud_onboarding_gate_response_if_blocked(route=HUD_ROUTE_BRIEF, actor=actor)
+        if blocked is not None:
+            return blocked
+
+        push_blocked = self._hud_push_policy_gate_response_if_blocked(
+            route=HUD_ROUTE_BRIEF, actor=actor, user_id=user_id
+        )
+        if push_blocked is not None:
+            return push_blocked
+
+        # === DEFAULT (no scope): classification-optimized structured soul extract for HUD Agent ===
+        if not explicit_scope:
+            try:
+                soul_path = self._hud_soul_md_path()
+                soul_content = soul_path.read_text(encoding="utf-8")
+            except Exception as exc:
+                return self._hud_store_error_response(route="/hud/brief", actor=actor, exc=exc)
+
+            extracted = self._hud_soul_md_extract_roles_and_goals(soul_content)
+            policy_value = None
+            try:
+                policy_value = self.hud_store.get_user_push_policy(user_id)
+            except Exception:
+                logger.exception("HUD brief get_user_push_policy failed user_id=%s", user_id)
+
+            push_status = {
+                "set": policy_value is not None,
+                "external_push_without_approval": bool(policy_value) if policy_value is not None else None,
+            }
+
+            # Priority / decision matrix guidance (maps to priority_class, semantic_type, requires_approval, google_target + role/goal)
+            # Derived from hud_workers + soul structure. Enables model to classify user context internally.
+            decision_matrix_guidance = {
+                "priority_class": {
+                    "values": ["critical", "high", "medium", "low", "normal"],
+                    "default_by_intent": {"ingest": "high", "brief": "medium", "classify": "normal", "project": "normal", "mcp": "critical"},
+                    "guidance": "Match to goal urgency/deadline from goals_by_role for the role; escalate for founder/public items or explicit urgency."
+                },
+                "semantic_type": {
+                    "values": ["task", "event", "note", "ingest", "briefing", "state_query", "intent_projection", "policy_change", "transport_routing", "unknown"],
+                    "guidance": "event for calendar/schedule; task for action/todo; note for reflection/journal; intent_projection for classify/project."
+                },
+                "google_target": {
+                    "values": ["calendar", "tasks", "obsidian"],
+                    "guidance": "calendar if time/schedule/meeting in context or goal; tasks for explicit todos/actions; obsidian (default) for role/goal notes and non-google items."
+                },
+                "requires_approval": {
+                    "guidance": "Usually False for ingest/dry_run; True when live projection to adapter (gcal/gtasks) or sensitive/high-stakes per policy. Can be overridden by explicit field or default from onboarding state."
+                },
+                "role_ref/goal_ref": "Select best matching role.slug (or name) from roles list, then matching goal from goals_by_role using that role (key by name or slug). Use for context in classification.",
+                "usage": "HUD Agent should call hud.brief (no scope) once per session or on soul change to load this, then use for all subsequent user context classification to set the fields before hud.ingest/classify/project."
+            }
+
+            return web.json_response(
+                hud_success_payload(
+                    "/hud/brief",
+                    status="ok",
+                    actor=actor,
+                    route_meta=self._hud_route_meta(HUD_INTENT_BRIEF),
+                    data={
+                        "mode": "classification_context",
+                        "onboarding_state": "fully_onboarded",
+                        "push_policy": push_status,
+                        "roles": extracted["roles"],
+                        "goals_by_role": extracted["goals_by_role"],
+                        "role_name_to_slug": extracted.get("role_name_to_slug", {}),
+                        "decision_matrix_guidance": decision_matrix_guidance,
+                    },
+                ),
+                status=200,
+            )
+
+        # === SCOPED MODE (scope=today|week|goal:xxx): user-facing items brief (original logic, post-gate so always fully_onboarded) ===
+        try:
+            items = self.hud_store.list_items(status="queued", limit=100, offset=0)
+            pending_approval_items = self.hud_store.list_items(
+                status="pending_approval",
+                limit=100,
+                offset=0,
+            )
+        except sqlite3.DatabaseError as exc:
+            return self._hud_store_error_response(route="/hud/brief", actor=actor, exc=exc)
+        except Exception as exc:
+            return self._hud_store_error_response(route="/hud/brief", actor=actor, exc=exc)
+
+        all_items = items + pending_approval_items
+        scoped_items = [item for item in all_items if item.get("scope") == scope]
+        deterministic_items = self._hud_deterministic_items(scoped_items)
+        onboarding_context = self._hud_onboarding_context_status()
+        onboarding_needed = onboarding_context["required"]
+        has_pending_approval = any(item.get("status") == "pending_approval" for item in scoped_items)
+        has_queued = any(item.get("status") == "queued" for item in scoped_items)
+        policy_fields = self._hud_push_policy_client_fields(user_id)
+        next_action = (
+            "onboard"
+            if onboarding_needed
+            else "process" if has_queued else ("review" if has_pending_approval else "wait")
+        )
+        if policy_fields.get("post_onboarding_push_policy_required"):
+            next_action = "choose_push_policy"
+
+        brief_issue_data = self._hud_sync_issue_data(deterministic_items)
+        adapter_sync_previews = await self._hud_adapter_sync_previews()
+
+        return web.json_response(
+            hud_success_payload(
+                "/hud/brief",
+                status="ok",
+                actor=actor,
+                route_meta=self._hud_route_meta(HUD_INTENT_BRIEF),
+                data={
+                    "scope": scope,
+                    "items": deterministic_items,
+                    "next_action": next_action,
+                    "onboarding_needed": onboarding_needed,
+                    "onboarding_needed_reason": onboarding_context,
+                    **policy_fields,
+                    **brief_issue_data,
+                    "adapter_sync_previews": adapter_sync_previews,
+                },
+            ),
+            status=200,
+        )
+    async def hud_project(self, request: Request) -> Response:
+        actor = self._hud_actor(request)
+        # Auth delegated to agent-service via catch-all _hud_forward passthrough
+
+        blocked = self._hud_onboarding_gate_response_if_blocked(route=HUD_ROUTE_PROJECT, actor=actor)
+        if blocked is not None:
+            return blocked
+
+        body = await request.text()
+        if body.strip():
+            try:
+                payload = require_json(body)
+            except ValueError as exc:
+                return web.json_response(
+                    hud_error_payload(
+                        str(exc),
+                        "validation_error",
+                        "invalid_payload",
+                        route=HUD_ROUTE_PROJECT,
+                        actor=actor,
+                    ),
+                    status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+                )
+        else:
+            payload = {}
+
+        user_id = self._hud_resolve_user_id(request, payload=payload)
+        push_blocked = self._hud_push_policy_gate_response_if_blocked(
+            route=HUD_ROUTE_PROJECT, actor=actor, user_id=user_id
+        )
+        if push_blocked is not None:
+            return push_blocked
+        try:
+            projection_bundle = self._hud_effective_projection_mode(
+                request,
+                user_id=user_id,
+                payload=payload,
+            )
+        except ValueError as exc:
+            return web.json_response(
+                hud_error_payload(
+                    str(exc),
+                    "validation_error",
+                    "invalid_payload",
+                    route=HUD_ROUTE_PROJECT,
+                    actor=actor,
+                ),
+                status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+            )
+        except sqlite3.DatabaseError as exc:
+            return self._hud_store_error_response(route=HUD_ROUTE_PROJECT, actor=actor, exc=exc)
+        except Exception as exc:
+            return self._hud_store_error_response(route=HUD_ROUTE_PROJECT, actor=actor, exc=exc)
+
+        projection_mode = projection_bundle["effective_projection_mode"]
+
+        # v1.3: support action/fate via hud.project (approve/reject/project); full approve/reject logic
+        # implemented in hud_mcp PROJECT dispatch for agent calls via {"method": "hud.project", ...}
+        # Direct REST /hud/project remains primarily for "project" updates (action defaults to project).
+        action = str(payload.get("action") or payload.get("fate") or "project").strip().lower()
+        if action not in ("project", "approve", "reject"):
+            action = "project"
+        if action != "project":
+            logger.info("[HUD] direct /hud/project called with action=%s (agent should prefer hud.mcp 'hud.project' for fate ops)", action)
+
+        payload = self._hud_apply_user_onboarding_context(payload, user_id=user_id)
+        onboarding_needed = bool(payload.get("onboarding_needed"))
+        onboarding_needed_reason = payload.get("onboarding_needed_reason")
+        classification, projection = self._hud_classify_project_pair(
+            payload,
+            intent=HUD_INTENT_PROJECT,
+            status=payload.get("status") or "queued",
+            projection_mode=projection_mode,
+        )
+        try:
+            self._hud_store_user_onboarding_state(
+                user_id,
+                payload=payload,
+                classification=classification,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to persist onboarding context for user_id=%s during project",
+                user_id,
+            )
+        item_ref = payload.get("item_id", payload.get("internal_id"))
+        if item_ref is not None and not isinstance(item_ref, str):
+            item_ref = str(item_ref)
+        if item_ref:
+            try:
+                existing_item = self.hud_store.get_item(item_ref)
+            except sqlite3.DatabaseError as exc:
+                return self._hud_store_error_response(
+                    route=HUD_ROUTE_PROJECT,
+                    actor=actor,
+                    exc=exc,
+                )
+            except Exception as exc:
+                return self._hud_store_error_response(
+                    route=HUD_ROUTE_PROJECT,
+                    actor=actor,
+                    exc=exc,
+                )
+            if existing_item is not None:
+                storage_payload = self._hud_storage_payload(existing_item.get("payload_json", {}))
+                storage_payload = self._hud_payload_with_hud_metadata(
+                    storage_payload,
+                    classification=classification,
+                    projection=projection,
+                )
+                try:
+                    self.hud_store.upsert_item(
+                        {
+                            "internal_id": item_ref,
+                            "google_id": existing_item.get("google_id"),
+                            "external_id": existing_item.get("external_id"),
+                            "actor": actor or existing_item.get("actor"),
+                            "intent": existing_item.get("intent") or HUD_INTENT_PROJECT,
+                            "scope": existing_item.get("scope"),
+                            "payload_json": storage_payload,
+                            "status": existing_item.get("status") or "pending",
+                            "priority_class": classification.get("priority_class"),
+                            "google_target": classification.get("google_target"),
+                            "semantic_type": classification.get("semantic_type"),
+                            "role_ref": classification.get("role_ref"),
+                            "goal_ref": classification.get("goal_ref"),
+                            "idempotency_key": existing_item.get("idempotency_key"),
+                            "source_id": existing_item.get("source_id") or self._hud_extract_source_id(payload),
+                            "last_synced_at": existing_item.get("last_synced_at") or payload.get("last_synced_at"),
+                            "next_run_at": existing_item.get("next_run_at"),
+                            "approved_by": existing_item.get("approved_by"),
+                            "reviewed_by": existing_item.get("reviewed_by"),
+                            "retry_count": existing_item.get("retry_count", 0),
+                        }
+                    )
+                except sqlite3.DatabaseError as exc:
+                    return self._hud_store_error_response(
+                        route=HUD_ROUTE_PROJECT,
+                        actor=actor,
+                        exc=exc,
+                    )
+                except Exception as exc:
+                    return self._hud_store_error_response(
+                        route=HUD_ROUTE_PROJECT,
+                        actor=actor,
+                        exc=exc,
+                    )
+
+        return web.json_response(
+            hud_success_payload(
+                HUD_ROUTE_PROJECT,
+                status="ok",
+                actor=actor,
+                route_meta=self._hud_route_meta(HUD_INTENT_PROJECT),
+                data={
+                    "intent": HUD_INTENT_PROJECT,
+                    "payload": payload,
+                    "onboarding_needed": onboarding_needed,
+                    "onboarding_needed_reason": onboarding_needed_reason,
+                    "classification": classification,
+                    "projection": projection,
+                    **self._hud_projection_mode_client_fields(projection_bundle),
+                },
+            ),
+            status=200,
+        )
+
+    async def hud_status(self, request: Request) -> Response:
+        return await self.hud_sync_status(request)
+
+    async def hud_sync_status(self, request: Request) -> Response:
+        actor = self._hud_actor(request)
+        # Auth removed - delegated to agent-service
+        route = str(request.path)
+
+        status_value = request.query.get("status")
+        if status_value is not None:
+            status_value = status_value.strip()
+            if not status_value:
+                status_value = None
+
+        raw_limit = request.query.get("limit", "100")
+        raw_offset = request.query.get("offset", "0")
+
+        try:
+            limit = int(raw_limit)
+            if limit < 0:
+                raise ValueError("hud.status query 'limit' must be >= 0")
+        except (TypeError, ValueError) as exc:
+            return web.json_response(
+                hud_error_payload(
+                    str(exc),
+                    "validation_error",
+                    "invalid_payload",
+                    route=route,
+                    actor=actor,
+                ),
+                status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+            )
+
+        try:
+            offset = int(raw_offset)
+            if offset < 0:
+                raise ValueError("hud.status query 'offset' must be >= 0")
+        except (TypeError, ValueError) as exc:
+            return web.json_response(
+                hud_error_payload(
+                    str(exc),
+                    "validation_error",
+                    "invalid_payload",
+                    route=route,
+                    actor=actor,
+                ),
+                status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+            )
+
+        blocked = self._hud_onboarding_gate_response_if_blocked(route=route, actor=actor)
+        if blocked is not None:
+            return blocked
+
+        user_id = self._hud_resolve_user_id(request)
+        push_blocked = self._hud_push_policy_gate_response_if_blocked(route=route, actor=actor, user_id=user_id)
+        if push_blocked is not None:
+            return push_blocked
+
+        try:
+            items = self.hud_store.list_items(status=status_value, limit=limit, offset=offset)
+        except sqlite3.DatabaseError as exc:
+            return self._hud_store_error_response(
+                route=route,
+                actor=actor,
+                exc=exc,
+            )
+        except Exception as exc:
+            return self._hud_store_error_response(
+                route=route,
+                actor=actor,
+                exc=exc,
+            )
+
+        status_data = self._hud_status_data(items)
+        status_data["adapter_sync_previews"] = await self._hud_adapter_sync_previews()
+
+        return web.json_response(
+            hud_success_payload(
+                route,
+                status="ok",
+                actor=actor,
+                route_meta={"intent": HUD_INTENT_SYNC_STATUS if route == HUD_ROUTE_SYNC_STATUS else HUD_INTENT_STATUS},
+                data=status_data,
+            ),
+            status=200,
+        )
+
+    async def hud_mcp(self, request: Request) -> Response:
+        actor = self._hud_actor(request)
+        # Auth delegated to agent-service via catch-all _hud_forward passthrough
+
+        try:
+            payload = require_json(await request.text())
+            jsonrpc = payload.get("jsonrpc")
+            method = payload.get("method")
+            if jsonrpc != "2.0":
+                raise ValueError("hud.mcp payload missing jsonrpc='2.0'")
+            if not isinstance(method, str) or not method.strip():
+                raise ValueError("hud.mcp payload missing method")
+            method = method.strip()
+        except ValueError as exc:
+            return web.json_response(
+                hud_error_payload(
+                    str(exc),
+                    "validation_error",
+                    "invalid_payload",
+                    route="/hud/mcp",
+                    actor=actor,
+                ),
+                status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+            )
+
+        route_intent = HUD_MCP_METHODS.get(method)
+        if route_intent is None:
+            return web.json_response(
+                hud_error_payload(
+                    f"Method '{method}' is not implemented",
+                    "route_error",
+                    "method_not_found",
+                    route="/hud/mcp",
+                    actor=actor,
+                ),
+                status=HUD_ERROR_HTTP_STATUS["method_not_found"],
+            )
+
+        params = payload.get("params")
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return web.json_response(
+                hud_error_payload(
+                    "hud.mcp payload 'params' must be an object",
+                    "validation_error",
+                    "invalid_payload",
+                    route="/hud/mcp",
+                    actor=actor,
+                ),
+                status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+            )
+        user_id = self._hud_resolve_user_id(request, payload=params)
+
+        if method not in self._HUD_MCP_UNGATED_ONBOARDING_METHODS:
+            blocked = self._hud_onboarding_gate_response_if_blocked(route=HUD_ROUTE_MCP, actor=actor)
+            if blocked is not None:
+                return blocked
+
+        if method not in self._HUD_MCP_EXEMPT_PUSH_POLICY_METHODS:
+            push_blocked = self._hud_push_policy_gate_response_if_blocked(
+                route=HUD_ROUTE_MCP, actor=actor, user_id=user_id
+            )
+            if push_blocked is not None:
+                return push_blocked
+
+        if route_intent == HUD_INTENT_ONBOARDING_READ_SOUL:
+            return self._hud_onboarding_soul_read_response(
+                actor=actor,
+                route="/hud/mcp",
+                route_meta=self._hud_route_meta(
+                    HUD_INTENT_ONBOARDING_READ_SOUL,
+                    method=method,
+                    jsonrpc=jsonrpc,
+                ),
+                request=request,
+            )
+
+        if route_intent == HUD_INTENT_ONBOARDING_WRITE_SOUL:
+            return self._hud_onboarding_soul_build_response(
+                actor=actor,
+                payload=params,
+                route="/hud/mcp",
+                route_meta=self._hud_route_meta(
+                    HUD_INTENT_ONBOARDING_WRITE_SOUL,
+                    method=method,
+                    jsonrpc=jsonrpc,
+                ),
+                request=request,
+            )
+
+        if route_intent == HUD_INTENT_SET_PUSH_POLICY:
+            explicit = self._hud_parse_explicit_bool(params.get("external_push_without_approval"))
+            if explicit is None:
+                return web.json_response(
+                    hud_error_payload(
+                        "external_push_without_approval must be an explicit boolean",
+                        "validation_error",
+                        "invalid_payload",
+                        route="/hud/mcp",
+                        actor=actor,
+                    ),
+                    status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+                )
+            try:
+                self.hud_store.set_user_push_policy(user_id, external_push=explicit)
+                if explicit:
+                    self.hud_store.set_user_projection_mode(user_id, HUD_PROJECTION_MODE_LIVE)
+                    self.hud_store.set_user_onboarding_state(user_id, requires_approval=False)
+                else:
+                    self.hud_store.set_user_projection_mode(user_id, HUD_PROJECTION_MODE_DRY_RUN)
+            except ValueError as exc:
+                return web.json_response(
+                    hud_error_payload(
+                        str(exc),
+                        "validation_error",
+                        "invalid_payload",
+                        route="/hud/mcp",
+                        actor=actor,
+                    ),
+                    status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+                )
+            except sqlite3.DatabaseError as exc:
+                return self._hud_store_error_response(route="/hud/mcp", actor=actor, exc=exc)
+            except Exception as exc:
+                return self._hud_store_error_response(route="/hud/mcp", actor=actor, exc=exc)
+            try:
+                projection_bundle = self._hud_effective_projection_mode(
+                    request, user_id=user_id, payload=params
+                )
+            except ValueError as exc:
+                return web.json_response(
+                    hud_error_payload(
+                        str(exc),
+                        "validation_error",
+                        "invalid_payload",
+                        route="/hud/mcp",
+                        actor=actor,
+                    ),
+                    status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+                )
+            except sqlite3.DatabaseError as exc:
+                return self._hud_store_error_response(route="/hud/mcp", actor=actor, exc=exc)
+            except Exception as exc:
+                return self._hud_store_error_response(route="/hud/mcp", actor=actor, exc=exc)
+            return web.json_response(
+                hud_success_payload(
+                    "/hud/mcp",
+                    status="ok",
+                    actor=actor,
+                    route_meta=self._hud_route_meta(
+                        HUD_INTENT_SET_PUSH_POLICY,
+                        method=method,
+                        jsonrpc=jsonrpc,
+                    ),
+                    data={
+                        "external_push_without_approval": explicit,
+                        **self._hud_projection_mode_client_fields(projection_bundle),
+                    },
+                ),
+                status=200,
+            )
+
+        if route_intent == HUD_INTENT_DELETE_USER_PROJECTION_MODE:
+            try:
+                deleted = self.hud_store.delete_user_projection_mode(user_id)
+            except ValueError as exc:
+                return web.json_response(
+                    hud_error_payload(
+                        str(exc),
+                        "validation_error",
+                        "invalid_payload",
+                        route="/hud/mcp",
+                        actor=actor,
+                    ),
+                    status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+                )
+            except sqlite3.DatabaseError as exc:
+                return self._hud_store_error_response(route="/hud/mcp", actor=actor, exc=exc)
+            except Exception as exc:
+                return self._hud_store_error_response(route="/hud/mcp", actor=actor, exc=exc)
+            bundle = self._hud_effective_projection_mode(request, user_id=user_id, payload=None)
+            return web.json_response(
+                hud_success_payload(
+                    "/hud/mcp",
+                    status="ok",
+                    actor=actor,
+                    route_meta=self._hud_route_meta(
+                        route_intent,
+                        method=method,
+                        jsonrpc=jsonrpc,
+                    ),
+                    data={
+                        "deleted": deleted,
+                        **self._hud_projection_mode_client_fields(bundle),
+                    },
+                ),
+                status=200,
+            )
+
+        if route_intent == HUD_INTENT_INGEST:
+            try:
+                projection_bundle = self._hud_effective_projection_mode(
+                    request,
+                    user_id=user_id,
+                    payload=params,
+                )
+            except ValueError as exc:
+                return web.json_response(
+                    hud_error_payload(
+                        str(exc),
+                        "validation_error",
+                        "invalid_payload",
+                        route="/hud/mcp",
+                        actor=actor,
+                    ),
+                    status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+                )
+            except sqlite3.DatabaseError as exc:
+                return self._hud_store_error_response(route="/hud/mcp", actor=actor, exc=exc)
+            except Exception as exc:
+                return self._hud_store_error_response(route="/hud/mcp", actor=actor, exc=exc)
+
+            projection_mode = projection_bundle["effective_projection_mode"]
+
+            try:
+                scope = parse_hud_scope(params.get("scope"))
+            except ValueError as exc:
+                return web.json_response(
+                    hud_error_payload(
+                        str(exc),
+                        "validation_error",
+                        "invalid_payload",
+                        route="/hud/mcp",
+                        actor=actor,
+                    ),
+                    status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+                )
+
+            import uuid
+
+            ingest_payload = self._hud_apply_user_onboarding_context(
+                dict(params),
+                user_id=user_id,
+            )
+            onboarding_needed = bool(ingest_payload.get("onboarding_needed"))
+            onboarding_needed_reason = ingest_payload.get("onboarding_needed_reason")
+            internal_id = ingest_payload.get("item_id", ingest_payload.get("internal_id"))
+            if internal_id is not None:
+                try:
+                    internal_id = validate_hud_id(internal_id)
+                except ValueError as exc:
+                    return web.json_response(
+                        hud_error_payload(
+                            str(exc),
+                            "validation_error",
+                            "invalid_payload",
+                            route="/hud/mcp",
+                            actor=actor,
+                        ),
+                        status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+                    )
+            else:
+                internal_id = uuid.uuid4().hex
+
+            idempotency_key = ingest_payload.get("idempotency", ingest_payload.get("idempotency_key"))
+            if idempotency_key is not None and not isinstance(idempotency_key, str):
+                idempotency_key = str(idempotency_key)
+
+            ingest_intent = ingest_payload.get("intent", HUD_INTENT_INGEST)
+            classification, projection = self._hud_classify_project_pair(
+                ingest_payload,
+                intent=ingest_intent,
+                status="queued",
+                projection_mode=projection_mode,
+            )
+            initial_status = "pending_approval" if projection.get("requires_approval") else "queued"
+            if initial_status == "pending_approval":
+                classification, projection = self._hud_classify_project_pair(
+                    ingest_payload,
+                    intent=ingest_intent,
+                    status=initial_status,
+                    projection_mode=projection_mode,
+                )
+
+            try:
+                self._hud_store_user_onboarding_state(
+                    user_id,
+                    payload=ingest_payload,
+                    classification=classification,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to persist onboarding context for user_id=%s during mcp ingest",
+                    user_id,
+                )
+            storage_payload = self._hud_storage_payload(ingest_payload)
+            storage_payload = self._hud_payload_with_hud_metadata(
+                storage_payload,
+                classification=classification,
+                projection=projection,
+            )
+
+            try:
+                item = self.hud_store.upsert_item(
+                    {
+                        "internal_id": internal_id,
+                        "google_id": ingest_payload.get("google_id"),
+                        "external_id": ingest_payload.get("external_id"),
+                        "actor": actor,
+                        "intent": ingest_intent,
+                        "scope": scope,
+                        "payload_json": storage_payload,
+                        "status": initial_status,
+                        "priority_class": classification.get("priority_class"),
+                        "google_target": classification.get("google_target"),
+                        "semantic_type": classification.get("semantic_type"),
+                        "role_ref": classification.get("role_ref"),
+                        "goal_ref": classification.get("goal_ref"),
+                        "idempotency_key": idempotency_key,
+                        "source_id": self._hud_extract_source_id(ingest_payload),
+                        "last_synced_at": ingest_payload.get("last_synced_at"),
+                    }
+                )
+            except sqlite3.DatabaseError as exc:
+                return self._hud_store_error_response(
+                    route="/hud/mcp",
+                    actor=actor,
+                    exc=exc,
+                )
+            except Exception as exc:
+                return self._hud_store_error_response(
+                    route="/hud/mcp",
+                    actor=actor,
+                    exc=exc,
+                )
+            if self._hud_projection_can_dispatch(item.get("status"), projection_mode):
+                adapter_projection = await self._hud_dispatch_projection(
+                    item.get("intent") or ingest_intent,
+                    self._hud_projection_payload_for_item(
+                        item,
+                        actor=actor,
+                        status=initial_status,
+                        projection_mode=projection_mode,
+                    ),
+                )
+            else:
+                reason = "projection deferred until approval"
+                if projection_mode != HUD_PROJECTION_MODE_LIVE:
+                    reason = "projection_mode is preview-only"
+                adapter_projection = self._hud_projection_noop_result(
+                    item.get("intent") or ingest_intent,
+                    status=item.get("status") or initial_status,
+                    projection_mode=projection_mode,
+                    reason=reason,
+                )
+
+            return web.json_response(
+                hud_success_payload(
+                    "/hud/mcp",
+                    status="ok",
+                    actor=actor,
+                    route_meta=self._hud_route_meta(
+                        route_intent,
+                        method=method,
+                        jsonrpc=jsonrpc,
+                    ),
+                    data={
+                        "item": item,
+                        "adapter_projection": adapter_projection,
+                        "onboarding_needed": onboarding_needed,
+                        "onboarding_needed_reason": onboarding_needed_reason,
+                        "classification": classification,
+                        "projection": projection,
+                        **self._hud_projection_mode_client_fields(projection_bundle),
+                    },
+                ),
+                status=200,
+            )
+
+        if route_intent == HUD_INTENT_BRIEF:
+            # Dual-mode MCP hud.brief (Phase 1 parity with REST): detect no explicit scope param
+            # (None/missing/empty string) -> return same classification_context payload as REST default.
+            # With explicit scope -> keep existing scoped items brief behavior.
+            scope_source = params.get("scope")
+            explicit_scope = scope_source is not None and str(scope_source).strip() != ""
+            if explicit_scope:
+                try:
+                    scope = parse_hud_scope(scope_source)
+                except ValueError as exc:
+                    return web.json_response(
+                        hud_error_payload(
+                            str(exc),
+                            "validation_error",
+                            "invalid_payload",
+                            route="/hud/mcp",
+                            actor=actor,
+                        ),
+                        status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+                    )
+            else:
+                scope = None
+
+            if not explicit_scope:
+                # === DEFAULT (no scope): structured classification_context for HUD Agent (roles/goals/decision matrix) ===
+                try:
+                    soul_path = self._hud_soul_md_path()
+                    soul_content = soul_path.read_text(encoding="utf-8")
+                except Exception as exc:
+                    return self._hud_store_error_response(route="/hud/mcp", actor=actor, exc=exc)
+
+                extracted = self._hud_soul_md_extract_roles_and_goals(soul_content)
+                policy_value = None
+                try:
+                    policy_value = self.hud_store.get_user_push_policy(user_id)
+                except Exception:
+                    logger.exception("HUD brief get_user_push_policy failed user_id=%s", user_id)
+
+                push_status = {
+                    "set": policy_value is not None,
+                    "external_push_without_approval": bool(policy_value) if policy_value is not None else None,
+                }
+
+                # Priority / decision matrix guidance (identical to REST /hud/brief no-scope path)
+                decision_matrix_guidance = {
+                    "priority_class": {
+                        "values": ["critical", "high", "medium", "low", "normal"],
+                        "default_by_intent": {"ingest": "high", "brief": "medium", "classify": "normal", "project": "normal", "mcp": "critical"},
+                        "guidance": "Match to goal urgency/deadline from goals_by_role for the role; escalate for founder/public items or explicit urgency."
+                    },
+                    "semantic_type": {
+                        "values": ["task", "event", "note", "ingest", "briefing", "state_query", "intent_projection", "policy_change", "transport_routing", "unknown"],
+                        "guidance": "event for calendar/schedule/meeting in context or goal; task for action/todo; note for reflection/journal; intent_projection for classify/project."
+                    },
+                    "google_target": {
+                        "values": ["calendar", "tasks", "obsidian"],
+                        "guidance": "calendar if time/schedule/meeting in context or goal; tasks for explicit todos/actions; obsidian (default) for role/goal notes and non-google items."
+                    },
+                    "requires_approval": {
+                        "guidance": "Usually False for ingest/dry_run; True when live projection to adapter (gcal/gtasks) or sensitive/high-stakes per policy. Can be overridden by explicit field or default from onboarding state."
+                    },
+                    "role_ref/goal_ref": "Select best matching role.slug (or name) from roles list, then matching goal from goals_by_role using that role (key by name or slug). Use for context in classification.",
+                    "usage": "HUD Agent should call hud.brief (no scope) once per session or on soul change to load this, then use for all subsequent user context classification to set the fields before hud.ingest/classify/project."
+                }
+
+                return web.json_response(
+                    hud_success_payload(
+                        "/hud/mcp",
+                        status="ok",
+                        actor=actor,
+                        route_meta=self._hud_route_meta(
+                            route_intent,
+                            method=method,
+                            jsonrpc=jsonrpc,
+                        ),
+                        data={
+                            "mode": "classification_context",
+                            "onboarding_state": "fully_onboarded",
+                            "push_policy": push_status,
+                            "roles": extracted["roles"],
+                            "goals_by_role": extracted["goals_by_role"],
+                            "role_name_to_slug": extracted.get("role_name_to_slug", {}),
+                            "decision_matrix_guidance": decision_matrix_guidance,
+                        },
+                    ),
+                    status=200,
+                )
+
+            # === SCOPED MODE (explicit scope provided): original user-facing planned items brief ===
+            try:
+                queued_items = self.hud_store.list_items(status="queued", limit=100, offset=0)
+                pending_approval_items = self.hud_store.list_items(
+                    status="pending_approval",
+                    limit=100,
+                    offset=0,
+                )
+            except sqlite3.DatabaseError as exc:
+                return self._hud_store_error_response(route="/hud/mcp", actor=actor, exc=exc)
+            except Exception as exc:
+                return self._hud_store_error_response(route="/hud/mcp", actor=actor, exc=exc)
+
+            all_items = queued_items + pending_approval_items
+            scoped_items = [item for item in all_items if item.get("scope") == scope]
+            deterministic_items = self._hud_deterministic_items(scoped_items)
+            brief_issue_data = self._hud_sync_issue_data(deterministic_items)
+            onboarding_context = self._hud_onboarding_context_status()
+            onboarding_needed = onboarding_context["required"]
+            has_pending_approval = any(item.get("status") == "pending_approval" for item in scoped_items)
+            has_queued = any(item.get("status") == "queued" for item in scoped_items)
+            policy_fields = self._hud_push_policy_client_fields(user_id)
+            next_action = (
+                "onboard"
+                if onboarding_needed
+                else "process" if has_queued else ("review" if has_pending_approval else "wait")
+            )
+            if policy_fields.get("post_onboarding_push_policy_required"):
+                next_action = "choose_push_policy"
+
+            return web.json_response(
+                hud_success_payload(
+                    "/hud/mcp",
+                    status="ok",
+                    actor=actor,
+                    route_meta=self._hud_route_meta(
+                        route_intent,
+                        method=method,
+                        jsonrpc=jsonrpc,
+                    ),
+                    data={
+                        "scope": scope,
+                        "items": deterministic_items,
+                        "next_action": next_action,
+                        "onboarding_needed": onboarding_needed,
+                        "onboarding_needed_reason": onboarding_context,
+                        **policy_fields,
+                        **brief_issue_data,
+                    },
+                ),
+                status=200,
+            )
+
+        if route_intent == HUD_INTENT_PROJECT:
+            try:
+                projection_bundle = self._hud_effective_projection_mode(
+                    request,
+                    user_id=user_id,
+                    payload=params,
+                )
+            except ValueError as exc:
+                return web.json_response(
+                    hud_error_payload(
+                        str(exc),
+                        "validation_error",
+                        "invalid_payload",
+                        route="/hud/mcp",
+                        actor=actor,
+                    ),
+                    status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+                )
+            except sqlite3.DatabaseError as exc:
+                return self._hud_store_error_response(route="/hud/mcp", actor=actor, exc=exc)
+            except Exception as exc:
+                return self._hud_store_error_response(route="/hud/mcp", actor=actor, exc=exc)
+
+            projection_mode = projection_bundle["effective_projection_mode"]
+
+            # v1.3 consolidation: hud.project now handles explicit item fate (project/approve/reject)
+            # based on "action" (or "fate") param or defaults to "project". Agent uses only hud.project.
+            action = str(params.get("action") or params.get("fate") or "project").strip().lower()
+            if action not in ("project", "approve", "reject"):
+                action = "project"
+
+            if action in ("approve", "reject"):
+                item_id = params.get("item_id") or params.get("internal_id")
+                if item_id is None or (isinstance(item_id, str) and not item_id.strip()):
+                    return web.json_response(
+                        hud_error_payload(
+                            "item_id is required for approve/reject action via hud.project",
+                            "validation_error",
+                            "invalid_payload",
+                            route="/hud/mcp",
+                            actor=actor,
+                        ),
+                        status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+                    )
+                try:
+                    item_id = validate_hud_id(str(item_id))
+                except ValueError as exc:
+                    return web.json_response(
+                        hud_error_payload(
+                            str(exc),
+                            "validation_error",
+                            "invalid_item_id",
+                            route="/hud/mcp",
+                            actor=actor,
+                        ),
+                        status=HUD_ERROR_HTTP_STATUS["invalid_item_id"],
+                    )
+                try:
+                    item = self.hud_store.get_item(item_id)
+                except sqlite3.DatabaseError as exc:
+                    return self._hud_store_error_response(route="/hud/mcp", actor=actor, exc=exc)
+                except Exception as exc:
+                    return self._hud_store_error_response(route="/hud/mcp", actor=actor, exc=exc)
+                if item is None:
+                    return self._hud_not_found_error_response(
+                        route="/hud/mcp", actor=actor, item_id=item_id
+                    )
+                if self._hud_is_terminal_status(item.get("status")):
+                    return web.json_response(
+                        hud_success_payload(
+                            "/hud/mcp",
+                            status="ok",
+                            actor=actor,
+                            route_meta=self._hud_route_meta(
+                                action,
+                                method=method,
+                                jsonrpc=jsonrpc,
+                            ),
+                            data={
+                                "item": item,
+                                "adapter_projection": {
+                                    "status": "noop",
+                                    "intent": item.get("intent", action),
+                                    "adapter": None,
+                                    "action": "noop",
+                                    "result": {
+                                        "status": "ok",
+                                        "message": "Item is already in terminal state",
+                                    },
+                                },
+                                **self._hud_projection_mode_client_fields(projection_bundle),
+                            },
+                        ),
+                        status=200,
+                    )
+                try:
+                    target_status = self._hud_next_status_for_intent(
+                        action, current_status=item.get("status")
+                    )
+                    if target_status is None:
+                        target_status = "approved" if action == "approve" else "rejected"
+                    updated = self.hud_store.transition_status(
+                        item_id,
+                        target_status,
+                        actor=actor,
+                        reviewed_by=actor,
+                    )
+                except ValueError as exc:
+                    return web.json_response(
+                        hud_error_payload(
+                            str(exc),
+                            "validation_error",
+                            "invalid_status_transition",
+                            route="/hud/mcp",
+                            actor=actor,
+                        ),
+                        status=HUD_ERROR_HTTP_STATUS["validation_error"],
+                    )
+                except sqlite3.DatabaseError as exc:
+                    return self._hud_store_error_response(route="/hud/mcp", actor=actor, exc=exc)
+                except Exception as exc:
+                    return self._hud_store_error_response(route="/hud/mcp", actor=actor, exc=exc)
+                if not updated:
+                    return self._hud_not_found_error_response(
+                        route="/hud/mcp", actor=actor, item_id=item_id
+                    )
+                try:
+                    item = self.hud_store.get_item(item_id)
+                except sqlite3.DatabaseError as exc:
+                    return self._hud_store_error_response(route="/hud/mcp", actor=actor, exc=exc)
+                except Exception as exc:
+                    return self._hud_store_error_response(route="/hud/mcp", actor=actor, exc=exc)
+                if item is None:
+                    return self._hud_not_found_error_response(
+                        route="/hud/mcp", actor=actor, item_id=item_id
+                    )
+
+                if action == "approve" and self._hud_projection_can_dispatch(item.get("status"), projection_mode):
+                    adapter_projection = await self._hud_dispatch_projection(
+                        item.get("intent", "ingest"),
+                        self._hud_projection_payload_for_item(
+                            item,
+                            actor=actor,
+                            status=target_status,
+                            projection_mode=projection_mode,
+                        ),
+                    )
+                    if self._hud_adapter_projection_failed(adapter_projection):
+                        last_error = self._hud_adapter_projection_error_message(
+                            adapter_projection, fallback_intent=item.get("intent", "ingest")
+                        )
+                        try:
+                            self.hud_store.update_status(
+                                item_id, "failed", actor=actor, reviewed_by=actor, last_error=last_error
+                            )
+                        except Exception:
+                            pass
+                        failure_payload = hud_error_payload(
+                            last_error, "adapter_error", "adapter_projection_failed", route="/hud/mcp", actor=actor
+                        )
+                        failure_payload["adapter_projection"] = adapter_projection
+                        failure_payload["data"] = {"item": item}
+                        return web.json_response(failure_payload, status=500)
+                else:
+                    reason = "projection dispatch skipped for reject or non-live mode"
+                    if projection_mode != HUD_PROJECTION_MODE_LIVE:
+                        reason = "projection_mode is preview-only"
+                    adapter_projection = self._hud_projection_noop_result(
+                        item.get("intent", action),
+                        status=target_status,
+                        projection_mode=projection_mode,
+                        reason=reason,
+                    )
+
+                return web.json_response(
+                    hud_success_payload(
+                        "/hud/mcp",
+                        status="ok",
+                        actor=actor,
+                        route_meta=self._hud_route_meta(
+                            action,
+                            method=method,
+                            jsonrpc=jsonrpc,
+                        ),
+                        data={
+                            "item": item,
+                            "adapter_projection": adapter_projection,
+                            **self._hud_projection_mode_client_fields(projection_bundle),
+                        },
+                    ),
+                    status=200,
+                )
+
+            # default / "project" action: continue with existing classification + upsert logic
+            params = self._hud_apply_user_onboarding_context(params, user_id=user_id)
+            classification, projection = self._hud_classify_project_pair(
+                params,
+                intent=route_intent,
+                status=params.get("status") or "queued",
+                projection_mode=projection_mode,
+            )
+            onboarding_needed = bool(params.get("onboarding_needed"))
+            onboarding_needed_reason = params.get("onboarding_needed_reason")
+            try:
+                self._hud_store_user_onboarding_state(
+                    user_id,
+                    payload=params,
+                    classification=classification,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to persist onboarding context for user_id=%s during mcp project",
+                    user_id,
+                )
+            item_ref = params.get("item_id", params.get("internal_id"))
+            if item_ref is not None and not isinstance(item_ref, str):
+                item_ref = str(item_ref)
+            if item_ref:
+                try:
+                    item = self.hud_store.get_item(item_ref)
+                except sqlite3.DatabaseError as exc:
+                    return self._hud_store_error_response(
+                        route="/hud/mcp",
+                        actor=actor,
+                        exc=exc,
+                    )
+                except Exception as exc:
+                    return self._hud_store_error_response(
+                        route="/hud/mcp",
+                        actor=actor,
+                        exc=exc,
+                    )
+                if item is not None:
+                    storage_payload = self._hud_payload_with_hud_metadata(
+                        self._hud_storage_payload(item.get("payload_json", {})),
+                        classification=classification,
+                        projection=projection,
+                    )
+                    try:
+                        self.hud_store.upsert_item(
+                            {
+                                "internal_id": item_ref,
+                                "google_id": item.get("google_id"),
+                                "external_id": item.get("external_id"),
+                                "actor": item.get("actor"),
+                                "intent": item.get("intent") or route_intent,
+                                "scope": item.get("scope"),
+                                "payload_json": storage_payload,
+                                "status": item.get("status") or "pending",
+                                "priority_class": classification.get("priority_class"),
+                                "google_target": classification.get("google_target"),
+                                "semantic_type": classification.get("semantic_type"),
+                                "role_ref": classification.get("role_ref"),
+                                "goal_ref": classification.get("goal_ref"),
+                                "idempotency_key": item.get("idempotency_key"),
+                                "source_id": item.get("source_id")
+                                or self._hud_extract_source_id(params),
+                                "last_synced_at": item.get("last_synced_at") or params.get("last_synced_at"),
+                                "next_run_at": item.get("next_run_at"),
+                                "approved_by": item.get("approved_by"),
+                                "reviewed_by": item.get("reviewed_by"),
+                                "retry_count": item.get("retry_count", 0),
+                            }
+                        )
+                    except sqlite3.DatabaseError as exc:
+                        return self._hud_store_error_response(
+                            route="/hud/mcp",
+                            actor=actor,
+                            exc=exc,
+                        )
+                    except Exception as exc:
+                        return self._hud_store_error_response(
+                            route="/hud/mcp",
+                            actor=actor,
+                            exc=exc,
+                        )
+            return web.json_response(
+                hud_success_payload(
+                    "/hud/mcp",
+                    status="ok",
+                    actor=actor,
+                    route_meta=self._hud_route_meta(
+                        route_intent,
+                        method=method,
+                        jsonrpc=jsonrpc,
+                    ),
+                    data={
+                        "onboarding_needed": onboarding_needed,
+                        "onboarding_needed_reason": onboarding_needed_reason,
+                        "classification": classification,
+                        "projection": projection,
+                        **self._hud_projection_mode_client_fields(projection_bundle),
+                    },
+                ),
+                status=200,
+            )
+
+        if route_intent in (HUD_INTENT_STATUS, HUD_INTENT_SYNC_STATUS):
+            status_filter = params.get("status")
+            if isinstance(status_filter, str):
+                status_filter = status_filter.strip()
+                if not status_filter:
+                    status_filter = None
+
+            raw_limit = params.get("limit", "100")
+            raw_offset = params.get("offset", "0")
+
+            try:
+                limit = int(raw_limit)
+                if limit < 0:
+                    raise ValueError("hud.status query 'limit' must be >= 0")
+            except (TypeError, ValueError) as exc:
+                return web.json_response(
+                    hud_error_payload(
+                        str(exc),
+                        "validation_error",
+                        "invalid_payload",
+                        route="/hud/mcp",
+                        actor=actor,
+                    ),
+                    status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+                )
+
+            try:
+                offset = int(raw_offset)
+                if offset < 0:
+                    raise ValueError("hud.status query 'offset' must be >= 0")
+            except (TypeError, ValueError) as exc:
+                return web.json_response(
+                    hud_error_payload(
+                        str(exc),
+                        "validation_error",
+                        "invalid_payload",
+                        route="/hud/mcp",
+                        actor=actor,
+                    ),
+                    status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+                )
+
+            try:
+                mcp_items = self.hud_store.list_items(status=status_filter, limit=limit, offset=offset)
+            except sqlite3.DatabaseError as exc:
+                return self._hud_store_error_response(
+                    route="/hud/mcp",
+                    actor=actor,
+                    exc=exc,
+                )
+            except Exception as exc:
+                return self._hud_store_error_response(
+                    route="/hud/mcp",
+                    actor=actor,
+                    exc=exc,
+                )
+
+            mcp_items = self._hud_deterministic_items(mcp_items)
+
+            status_data = self._hud_status_data(mcp_items)
+
+            return web.json_response(
+                hud_success_payload(
+                    "/hud/mcp",
+                    status="ok",
+                    actor=actor,
+                    route_meta=self._hud_route_meta(
+                        route_intent,
+                        method=method,
+                        jsonrpc=jsonrpc,
+                    ),
+                    data=status_data,
+                ),
+                status=200,
+            )
+
+        return web.json_response(
+            hud_success_payload(
+                "/hud/mcp",
+                status="ok",
+                actor=actor,
+                route_meta=self._hud_route_meta(
+                    HUD_INTENT_MCP,
+                    method=method,
+                    jsonrpc=jsonrpc,
+                ),
+                data={
+                    "jsonrpc": jsonrpc,
+                    "method": method,
+                    "params": params,
+                },
+            ),
+            status=200,
+        )
     
+
+    async def hud_set_push_policy(self, request: Request) -> Response:
+        actor = self._hud_actor(request)
+        # Auth delegated to agent-service via catch-all _hud_forward passthrough
+
+        try:
+            payload = require_json(await request.text())
+        except ValueError as exc:
+            return web.json_response(
+                hud_error_payload(
+                    str(exc),
+                    "validation_error",
+                    "invalid_payload",
+                    route="/hud/push_policy",
+                    actor=actor,
+                ),
+                status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+            )
+
+        explicit = self._hud_parse_explicit_bool(payload.get("external_push_without_approval"))
+        if explicit is None:
+            return web.json_response(
+                hud_error_payload(
+                    "external_push_without_approval must be an explicit boolean",
+                    "validation_error",
+                    "invalid_payload",
+                    route="/hud/push_policy",
+                    actor=actor,
+                ),
+                status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+            )
+
+        user_id = self._hud_resolve_user_id(request, payload=payload)
+
+        blocked = self._hud_onboarding_gate_response_if_blocked(route="/hud/push_policy", actor=actor)
+        if blocked is not None:
+            return blocked
+
+        try:
+            self.hud_store.set_user_push_policy(user_id, external_push=explicit)
+            if explicit:
+                self.hud_store.set_user_projection_mode(user_id, HUD_PROJECTION_MODE_LIVE)
+                self.hud_store.set_user_onboarding_state(user_id, requires_approval=False)
+            else:
+                self.hud_store.set_user_projection_mode(user_id, HUD_PROJECTION_MODE_DRY_RUN)
+        except ValueError as exc:
+            return web.json_response(
+                hud_error_payload(
+                    str(exc),
+                    "validation_error",
+                    "invalid_payload",
+                    route="/hud/push_policy",
+                    actor=actor,
+                ),
+                status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+            )
+        except sqlite3.DatabaseError as exc:
+            return self._hud_store_error_response(route="/hud/push_policy", actor=actor, exc=exc)
+        except Exception as exc:
+            return self._hud_store_error_response(route="/hud/push_policy", actor=actor, exc=exc)
+
+        try:
+            projection_bundle = self._hud_effective_projection_mode(
+                request, user_id=user_id, payload=payload
+            )
+        except ValueError as exc:
+            return web.json_response(
+                hud_error_payload(
+                    str(exc),
+                    "validation_error",
+                    "invalid_payload",
+                    route="/hud/push_policy",
+                    actor=actor,
+                ),
+                status=HUD_ERROR_HTTP_STATUS["invalid_payload"],
+            )
+        except sqlite3.DatabaseError as exc:
+            return self._hud_store_error_response(route="/hud/push_policy", actor=actor, exc=exc)
+        except Exception as exc:
+            return self._hud_store_error_response(route="/hud/push_policy", actor=actor, exc=exc)
+
+        return web.json_response(
+            hud_success_payload(
+                "/hud/push_policy",
+                status="ok",
+                actor=actor,
+                route_meta=self._hud_route_meta(HUD_INTENT_SET_PUSH_POLICY),
+                data={
+                    "external_push_without_approval": explicit,
+                    **self._hud_projection_mode_client_fields(projection_bundle),
+                },
+            ),
+            status=200,
+        )
+
     async def _monitor_memory(self):
         """Background task to monitor GPU memory"""
         while True:
@@ -3900,6 +7760,12 @@ class UnifiedProxy:
 
             async def _run() -> None:
                 try:
+                    if not manage_containers_enabled():
+                        logger.error(
+                            "[ENGINE_RECREATE] BLOCKED model=%s PROXY_MANAGE_CONTAINERS=0 (Studio owns inference)",
+                            model_id,
+                        )
+                        return
                     await asyncio.to_thread(self.model_manager.unload_model, model_id)
                     await asyncio.sleep(2.0)
                     await asyncio.to_thread(self.model_manager.load_model, model_id)
